@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!--
+      The XL API (cdn_api.dll and the cdn_api20251.net.dll wrapper) is 32-bit, so everything that
+      touches it must be x86 - this library and every process that reaches for it.
+    -->
+    <PlatformTarget>x86</PlatformTarget>
+    <!--
+      The whole library runs on Windows only: it wraps the native Comarch ERP XL API. The platform
+      compatibility analyser warns about reading the registry because the target framework is not
+      formally narrowed - and it cannot be, because the service targets net10.0.
+    -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.11" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Gaska.Payments.Domain\Gaska.Payments.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="cdn_api20251.net">
+      <HintPath>lib\cdn_api20251.net.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

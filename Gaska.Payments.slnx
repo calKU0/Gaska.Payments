@@ -1,0 +1,8 @@
+<Solution>
+  <Project Path="Gaska.Payments.Domain/Gaska.Payments.Domain.csproj" />
+  <Project Path="Gaska.Payments.Erp/Gaska.Payments.Erp.csproj" />
+  <Project Path="Gaska.Payments.Integrations/Gaska.Payments.Integrations.csproj" />
+  <Project Path="Gaska.Payments.Application/Gaska.Payments.Application.csproj" />
+  <Project Path="Gaska.Payments.Service/Gaska.Payments.Service.csproj" />
+  <Project Path="Gaska.Payments.Desktop/Gaska.Payments.Desktop.csproj" />
+</Solution>

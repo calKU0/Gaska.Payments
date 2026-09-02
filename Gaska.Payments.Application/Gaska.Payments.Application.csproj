@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Orchestrates the XL API, so it inherits its 32-bit requirement. -->
+    <PlatformTarget>x86</PlatformTarget>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.11" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="cdn_api20251.net">
+      <HintPath>..\Gaska.Payments.Erp\lib\cdn_api20251.net.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Gaska.Payments.Domain\Gaska.Payments.Domain.csproj" />
+    <ProjectReference Include="..\Gaska.Payments.Erp\Gaska.Payments.Erp.csproj" />
+    <ProjectReference Include="..\Gaska.Payments.Integrations\Gaska.Payments.Integrations.csproj" />
+  </ItemGroup>
+
+</Project>

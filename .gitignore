@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------- secrets ---
+# appsettings.json carries database credentials, the bank certificate password
+# and the mailbox password. The committed *.example.json files show the shape
+# without the values; copy one and fill it in locally.
+**/appsettings.json
+**/appsettings.*.json
+!**/appsettings.example.json
+
+# Private keys and certificates - the bank certificate above all.
+*.pfx
+*.p12
+*.pem
+*.key
+*.snk
+Certificates/
+
+# User secrets and anything obviously local
+secrets.json
+*.local.json
+.env
+.env.*
+
+# ------------------------------------------------------------ build output ---
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+*.dll
+*.exe
+*.pdb
+!Gaska.Payments.Erp/lib/*.dll
+
+# ------------------------------------------------------- what the app writes ---
+# Logs and the archive of statements and courier reports: business documents and
+# personal data, never in a repository.
+logs/
+Archiwum/
+Wyciągi/
+Pobrania/
+
+# ------------------------------------------------------------------- tools ---
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.claude/
+
+# --------------------------------------------------------------- scratch ---
+*.bak
+*.tmp
+*.orig
+*.rej
+~$*
+Thumbs.db
+.DS_Store
