@@ -1,4 +1,4 @@
-using Microsoft.Data.SqlClient;
+﻿using Microsoft.Data.SqlClient;
 
 namespace Gaska.Payments.Application.Settlement;
 
@@ -243,6 +243,17 @@ public static class PaymentSchema
             );
 
             CREATE INDEX IX_BnpCodReport_PayoutDate ON pay.CourierReport (PayoutDate);
+        END;
+
+        -- The application's queue joins one proposal to each cash entry by ErpEntryId. Without an
+        -- index that is a scan of the whole table per entry - 18 591 entries over the default
+        -- sixty-day window, which is most of the three seconds the queue took to load.
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes
+                       WHERE object_id = OBJECT_ID('pay.Payment')
+                         AND name = 'IX_BnpSettlementPayment_ErpEntry')
+        BEGIN
+            CREATE INDEX IX_BnpSettlementPayment_ErpEntry
+                ON pay.Payment (ErpEntryId) INCLUDE (PaymentId);
         END;
 
         -- How far a courier report has got. A report waits as long as it has to: the entries

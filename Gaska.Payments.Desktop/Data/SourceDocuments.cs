@@ -53,21 +53,116 @@ public sealed class SourceDocuments(string archiveDirectory, ILogger? logger = n
     /// <summary>
     /// The file behind the entry, or null when the archive holds none.
     /// </summary>
+    /// <summary>
+    /// Guards what has been looked up.
+    /// </summary>
+    /// <remarks>
+    /// The queue is built on a worker thread while the operator can still click a row, and
+    /// entering a row asks the archive again. Two threads, one set of dictionaries.
+    /// </remarks>
+    private readonly Lock _gate = new();
+
     public string? Find(PaymentRow row)
     {
         if (!IsConfigured) return null;
 
+        lock (_gate) return Look(row);
+    }
+
+    private string? Look(PaymentRow row)
+    {
+
         // A cash on delivery entry carries its report's path, written when the report was read.
-        if (row.SourceFile.Length > 0) return File.Exists(row.SourceFile) ? row.SourceFile : null;
+        // Answers are remembered because one report covers a whole payout - the same path comes
+        // back on dozens of rows, and over a share each of them was a round trip of its own.
+        if (row.SourceFile.Length > 0)
+        {
+            if (!_files.TryGetValue(row.SourceFile, out var there))
+            {
+                there = FileIsThere(row.SourceFile);
+                _files[row.SourceFile] = there;
+            }
+
+            return there ? row.SourceFile : null;
+        }
 
         var folder = StatementFolder(row.RegisterSeries);
         if (folder is null) return null;
 
-        var path = Path.Combine(
-            folder, row.BookingDate.ToString("yyyy-MM"),
-            $"{row.RegisterSeries}_{row.BookingDate:yyyy-MM-dd}.pdf");
+        var month = row.BookingDate.ToString("yyyy-MM");
+        var name = $"{row.RegisterSeries}_{row.BookingDate:yyyy-MM-dd}.pdf";
 
-        return File.Exists(path) ? path : null;
+        return MonthOf(folder, month).Contains(name)
+            ? Path.Combine(folder, month, name)
+            : null;
+    }
+
+    /// <summary>Whether one file is there, treating an unreachable share as "no".</summary>
+    private static bool FileIsThere(string path)
+    {
+        try { return File.Exists(path); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>What each answer cost is remembered - see <see cref="MonthOf"/>.</summary>
+    private readonly Dictionary<string, bool> _files = new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly Dictionary<string, HashSet<string>> _months = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The statements one month's folder holds, listed once.
+    /// </summary>
+    /// <remarks>
+    /// Asking <c>File.Exists</c> per transfer meant one round trip per row - eighteen thousand of
+    /// them over the sixty days the queue opens on, against a folder on a share. One listing per
+    /// register and month answers all of them: a month holds at most thirty-one statements, and
+    /// the queue spans two or three months.
+    ///
+    /// A month that is not there yet is remembered as empty and asked about again on the next
+    /// load, not on the next row - today's statement appears during the day, and the queue is
+    /// reloaded often enough for that to show up.
+    /// </remarks>
+    private HashSet<string> MonthOf(string folder, string month)
+    {
+        var key = Path.Combine(folder, month);
+        if (_months.TryGetValue(key, out var files)) return files;
+
+        try
+        {
+            files = Directory.Exists(key)
+                ? new HashSet<string>(
+                    Directory.EnumerateFiles(key, "*.pdf").Select(f => Path.GetFileName(f)!),
+                    StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            Warn("Nie mogę odczytać {Folder}: {Blad}", key, exception.Message);
+            files = [];
+        }
+
+        _months[key] = files;
+        return files;
+    }
+
+    /// <summary>
+    /// Forgets what was found, so the next load looks at the archive again.
+    /// </summary>
+    /// <remarks>
+    /// Called when the queue is reloaded. Without it a statement written after the application
+    /// started would stay invisible for the rest of the session.
+    /// </remarks>
+    public void Forget()
+    {
+        lock (_gate)
+        {
+            _files.Clear();
+            _months.Clear();
+            _folders.Clear();
+        }
     }
 
     /// <summary>

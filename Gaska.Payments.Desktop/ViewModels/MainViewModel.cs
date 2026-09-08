@@ -74,7 +74,7 @@ public sealed class MainViewModel : ObservableObject
         View.SortDescriptions.Add(
             new SortDescription(nameof(PaymentItem.BookingDate), ListSortDirection.Descending));
 
-        foreach (var option in SettlementFilters) Watch(option, nameof(SettlementFilterSummary));
+        foreach (var option in SettlementFilters) WatchSettlement(option);
         foreach (var option in ConfidenceFilters) Watch(option, nameof(ConfidenceFilterSummary));
 
         foreach (var option in DirectionFilters)
@@ -124,7 +124,7 @@ public sealed class MainViewModel : ObservableObject
 
     // ------------------------------------------------------------------ data ---
 
-    public ObservableCollection<PaymentItem> Payments { get; } = [];
+    public BulkObservableCollection<PaymentItem> Payments { get; } = [];
 
     public ICollectionView View { get; }
 
@@ -351,6 +351,41 @@ public sealed class MainViewModel : ObservableObject
     public string DirectionFilterSummary => FilterOption.Summarize(DirectionFilters);
 
     public string RegisterFilterSummary => FilterOption.Summarize(RegisterFilters);
+
+    /// <summary>
+    /// Whether the filter is asking for entries that are finished business.
+    /// </summary>
+    /// <remarks>
+    /// Both states start unticked, so the usual answer is no and the queue fetches a twentieth of
+    /// the rows. Ticking either is what makes the application go and get the rest.
+    /// </remarks>
+    private bool NeedsHistory => SettlementFilters.Any(
+        f => f.IsSelected && f.State is SettlementState.Settled or SettlementState.DoNotSettle);
+
+    /// <summary>Whether what is loaded now includes that history.</summary>
+    private bool _historyLoaded;
+
+    /// <summary>
+    /// The settlement filter is watched apart from the others: ticking a state that is not in
+    /// memory has to fetch it before the list can show it.
+    /// </summary>
+    private void WatchSettlement(FilterOption option)
+    {
+        option.PropertyChanged += (_, _) =>
+        {
+            Raise(nameof(SettlementFilterSummary));
+
+            if (NeedsHistory && !_historyLoaded && !IsBusy)
+            {
+                _ = LoadAsync();
+                return;
+            }
+
+            View.Refresh();
+            Raise(nameof(QueueCount));
+            Raise(nameof(QueueTotal));
+        };
+    }
 
     /// <summary>Refreshes the document list when one of its own filters is ticked.</summary>
     private void WatchDocuments(FilterOption option, string summaryProperty)
@@ -850,8 +885,27 @@ public sealed class MainViewModel : ObservableObject
             IsBusy = true;
 
             var from = From.Date;
-            var queue = await _repository.GetQueueAsync(from);
-            var suggestions = (await _repository.GetSuggestionsAsync(from))
+
+            // The three queries that do not depend on one another go together. The chart is read
+            // once per session: the picker offers all of it, and per row it would be a megabyte and
+            // a half of text every time somebody clicked.
+            // Settled entries and those flagged "nie rozliczaj" are fetched only when the filter
+            // asks for them - they are eighteen thousand rows against five hundred, and twenty
+            // times the wait.
+            var withHistory = NeedsHistory;
+            var queueQuery = _repository.GetQueueAsync(from, withHistory);
+            var suggestionQuery = _repository.GetSuggestionsAsync(from);
+            var chartQuery = _chart.Count > 0
+                ? Task.FromResult(_chart)
+                : _repository.GetChartOfAccountsAsync();
+
+            await Task.WhenAll(queueQuery, suggestionQuery, chartQuery);
+
+            var queue = await queueQuery;
+            _chart = await chartQuery;
+            _historyLoaded = withHistory;
+
+            var suggestions = (await suggestionQuery)
                 .GroupBy(s => s.PaymentId)
                 .ToDictionary(g => g.Key, g => (IReadOnlyList<SuggestionRow>)[.. g]);
 
@@ -862,27 +916,45 @@ public sealed class MainViewModel : ObservableObject
             var accounts = await _repository.GetContractorAccountsAsync(
                 [.. queue.Select(r => r.ContractorId)]);
 
-            // The chart of accounts is read once and kept: the picker offers all of it, and per
-            // row it would be a megabyte and a half of text every time somebody clicked.
-            if (_chart.Count == 0) _chart = await _repository.GetChartOfAccountsAsync();
+            // A statement written since the last load has to be found, so what the archive said
+            // before is dropped rather than carried over.
+            _documents.Forget();
 
-            foreach (var old in Payments) old.PropertyChanged -= OnPaymentChanged;
-            Payments.Clear();
-            Selected = null;
-
-            foreach (var row in queue)
+            // Built away from the interface thread. Eighteen thousand rows, each asking the
+            // archive whether its statement is on disk, is a second or more of straight-line work,
+            // and on the thread that draws the window it stops the window: the progress bar freezes
+            // mid-animation and the application looks hung just as it is finishing. Nothing here
+            // touches a control - the items are not bound to anything until they are handed over
+            // below.
+            var built = await Task.Run(() =>
             {
-                var item = new PaymentItem(row) { SourceDocument = _documents.Find(row) };
-                if (suggestions.TryGetValue(row.PaymentId, out var hits)) item.Suggestions = hits;
+                var list = new List<PaymentItem>(queue.Count);
 
-                if (accounts.TryGetValue(row.ContractorId, out var forContractor))
+                foreach (var row in queue)
                 {
-                    item.SetAccountOptions(forContractor, row.ContractorId);
+                    var item = new PaymentItem(row) { SourceDocument = _documents.Find(row) };
+                    if (suggestions.TryGetValue(row.PaymentId, out var hits)) item.Suggestions = hits;
+
+                    if (accounts.TryGetValue(row.ContractorId, out var forContractor))
+                    {
+                        item.SetAccountOptions(forContractor, row.ContractorId);
+                    }
+
+                    list.Add(item);
                 }
 
-                item.PropertyChanged += OnPaymentChanged;
-                Payments.Add(item);
-            }
+                return list;
+            });
+
+            foreach (var item in built) item.PropertyChanged += OnPaymentChanged;
+
+            foreach (var old in Payments) old.PropertyChanged -= OnPaymentChanged;
+            Selected = null;
+
+            // One change for the whole list. Added row by row, the view re-ran its filter over
+            // everything added so far and told the grid about each one - that, not the queries,
+            // was most of the wait on a sixty-day window.
+            Payments.Reset(built);
 
             loading.Result(
                 $"{queue.Count} entries from {From:yyyy-MM-dd}, {suggestions.Count} with the engine's hints, "
@@ -890,9 +962,8 @@ public sealed class MainViewModel : ObservableObject
                 + $"{accounts.Count} contractors with accounts, "
                 + $"{_chart.Count} accounts in the plan");
 
-            // Counters only after filtering - they count what is visible on the list.
-            View.Refresh();
-
+            // Counters only after filtering - they count what is visible on the list. Leaving the
+            // deferral above already refreshed the view, so no second pass is needed.
             Raise(nameof(QueueCount));
             Raise(nameof(QueueTotal));
             RaiseCheckedTotals();
@@ -906,6 +977,10 @@ public sealed class MainViewModel : ObservableObject
         {
             IsBusy = false;
         }
+
+        // A state ticked while this load was already running found the application busy and was
+        // left to the list as it stood. Now that it is free, fetch what that tick asked for.
+        if (NeedsHistory && !_historyLoaded) await LoadAsync();
     }
 
     /// <summary>

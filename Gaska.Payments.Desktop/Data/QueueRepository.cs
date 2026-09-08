@@ -157,8 +157,13 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
     /// are the majority here; the accountant wants to see them all the same, if only to check
     /// what the automat did.
     ///
-    /// Entries flagged "not subject to settlement" (<c>KAZ_Rozliczony = 2</c>) come with the rest
-    /// and carry a state of their own on the filter, unticked by default. They are VAT legs of
+    /// Settled entries and those flagged "not subject to settlement" are fetched only when the
+    /// filter asks for them. They are eighteen thousand of the eighteen and a half over the default
+    /// window and take 2,3 s to fetch against 0,1 s for the rest, so paying for them on every load
+    /// meant every refresh - and every settlement - waited on history nobody had asked to see.
+    ///
+    /// Entries flagged "not subject to settlement" (<c>KAZ_Rozliczony = 2</c>) carry a state of
+    /// their own on the filter, unticked by default. They are VAT legs of
     /// split payments, commissions and courier payouts - not open items and never will be - but
     /// they have to be reachable, because taking the flag off one is the only way back when it was
     /// set by mistake.
@@ -169,7 +174,18 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
     /// over the API and they reach ERP through its own statement import. Driving it from ERP also
     /// means one row per entry however many proposals point at it.
     /// </remarks>
-    public async Task<IReadOnlyList<PaymentRow>> GetQueueAsync(DateTime from, CancellationToken token = default)
+    /// <summary>
+    /// The entries that still have work in them: nothing settled against them yet, or only part.
+    /// </summary>
+    /// <remarks>
+    /// The dividing line between what the queue needs at once and what it fetches only if asked.
+    /// Over the sixty days the window opens on, this is 503 entries out of 18 591 - the rest is
+    /// history, already settled or flagged, and both of those start unticked on the filter.
+    /// </remarks>
+    public const string HasWorkSql = "KAZ_Rozliczony = 0 AND KAZ_Pozostaje > 0.004";
+
+    public async Task<IReadOnlyList<PaymentRow>> GetQueueAsync(
+        DateTime from, bool withHistory, CancellationToken token = default)
     {
         if (registers.All.Count == 0) return [];
 
@@ -257,6 +273,7 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                 ON z.KAZ_KNTTyp = 944 AND prc.Prc_GIDNumer = z.KAZ_KntNumer
             WHERE RTRIM(rap.KRP_Seria) IN ({string.Join(", ", seriesParameters)})
               AND rap.KRP_DataOtwarcia >= DATEDIFF(DAY, '1800-12-28', @from)
+              {(withHistory ? string.Empty : $"AND z.{HasWorkSql}")}
             ORDER BY rap.KRP_DataOtwarcia DESC, z.KAZ_Kwota DESC
             """;
 
@@ -638,9 +655,20 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
     /// no settlement behind it. Entries marked "nie rozliczaj" (<c>KAZ_Rozliczony = 2</c>) are left
     /// out - somebody has already decided those are not to be matched against anything.
     ///
-    /// The transfer being worked on is excluded by its own entry. Without that, the money on the
-    /// screen would count itself and every unsettled transfer would look like an overpayment of
-    /// exactly its own amount.
+    /// The party has to be a contractor, not merely carry the contractor's number. Employees (944)
+    /// and offices (4304) are numbered from sequences of their own, so an employee's cash advance
+    /// counted as somebody's overpayment: AGROMA-O, contractor 290, was shown 9 541,09 zł of which
+    /// 2 526,12 was six payroll entries on employee 290 from 2021. On this register 63 contractors
+    /// were inflated that way, by 29,2 million in total.
+    ///
+    /// Only what was already sitting there when this transfer arrived counts: an entry from an
+    /// earlier day, or from the same day with a lower <c>KAZ_GIDNumer</c>. The question the figure
+    /// answers is "was this contractor's money waiting before this came in", and a payment that
+    /// landed afterwards is not an answer to it - nor is the transfer itself, which would otherwise
+    /// make every unsettled transfer look like an overpayment of exactly its own amount.
+    ///
+    /// So two transfers of one contractor on one day read differently on purpose: the first shows
+    /// nothing, the second shows the first.
     /// </remarks>
     public async Task<IReadOnlyList<ContractorOverpayment>> GetOverpaymentsAsync(
         int contractorId, int exceptEntryId, CancellationToken token = default)
@@ -648,16 +676,31 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
         if (contractorId == 0) return [];
 
         const string sql = """
+            -- The day of the transfer being worked on. Its report's opening day is the one the
+            -- queue shows, so the cut-off is the same date the accountant is reading on screen.
+            DECLARE @dzien INT = (
+                SELECT TOP 1 rap.KRP_DataOtwarcia
+                FROM CDN.Zapisy AS z
+                INNER JOIN CDN.Raporty AS rap
+                    ON rap.KRP_GIDNumer = z.KAZ_KRPNumer AND rap.KRP_GIDTyp = z.KAZ_KRPTyp
+                WHERE z.KAZ_GIDNumer = @except);
+
             SELECT RTRIM(z.KAZ_Waluta) AS Waluta, COUNT(*) AS Wplat,
                    SUM(z.KAZ_Pozostaje) AS Kwota, MIN(rap.KRP_DataOtwarcia) AS Najstarszy
             FROM CDN.Zapisy AS z
             INNER JOIN CDN.Raporty AS rap
                 ON rap.KRP_GIDNumer = z.KAZ_KRPNumer AND rap.KRP_GIDTyp = z.KAZ_KRPTyp
             WHERE z.KAZ_KNTNumer = @knt
+              AND z.KAZ_KNTTyp = 32
               AND z.KAZ_RP = 2
               AND z.KAZ_Rozliczony = 0
               AND z.KAZ_Pozostaje > 0.004
-              AND z.KAZ_GIDNumer <> @except
+              -- Only money that was already there: an earlier day, or the same day but booked
+              -- before this one. The entry itself falls out of this by itself - its own number is
+              -- not smaller than its own.
+              AND (@dzien IS NULL
+                   OR rap.KRP_DataOtwarcia < @dzien
+                   OR (rap.KRP_DataOtwarcia = @dzien AND z.KAZ_GIDNumer < @except))
             GROUP BY z.KAZ_Waluta
             ORDER BY SUM(z.KAZ_Pozostaje) DESC
             """;
