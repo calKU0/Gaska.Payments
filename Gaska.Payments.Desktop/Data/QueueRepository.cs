@@ -1,6 +1,7 @@
-using System.Data;
+﻿using System.Data;
 using Gaska.Payments.Domain.Model;
 using Gaska.Payments.Erp;
+using Gaska.Payments.Erp.Reads;
 using Microsoft.Data.SqlClient;
 
 namespace Gaska.Payments.Desktop.Data;
@@ -40,7 +41,8 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                    pl.TrP_KntNumer, ISNULL(RTRIM(k.Knt_Akronim), '') AS Acronym,
                    RTRIM(ISNULL(o.OB_Skrot, '')) AS Symbol,
                    COALESCE(NULLIF(RTRIM(n.TrN_DokumentObcy), ''),
-                            NULLIF(RTRIM(imp.ImN_DokumentObcy), ''), '') AS DokumentObcy
+                            NULLIF(RTRIM(imp.ImN_DokumentObcy), ''), '') AS DokumentObcy,
+                   pl.TrP_Rozliczona
             FROM CDN.TraPlat AS pl
             LEFT JOIN CDN.TraNag AS n
                 ON n.TrN_GIDTyp = pl.TrP_GIDTyp AND n.TrN_GIDNumer = pl.TrP_GIDNumer
@@ -155,9 +157,11 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
     /// are the majority here; the accountant wants to see them all the same, if only to check
     /// what the automat did.
     ///
-    /// Entries flagged "not subject to settlement" (<c>KAZ_Rozliczony = 2</c>) are left out: those
-    /// are VAT legs of split payments and bank commissions - they are not open items and never
-    /// will be.
+    /// Entries flagged "not subject to settlement" (<c>KAZ_Rozliczony = 2</c>) come with the rest
+    /// and carry a state of their own on the filter, unticked by default. They are VAT legs of
+    /// split payments, commissions and courier payouts - not open items and never will be - but
+    /// they have to be reachable, because taking the flag off one is the only way back when it was
+    /// set by mistake.
     ///
     /// The query is driven by <c>CDN.Zapisy</c>, with our own proposals joined on the outside.
     /// It used to be the other way round, and that hid every entry the service had not downloaded
@@ -186,7 +190,14 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                    ISNULL(p.PayerAccount, '')                             AS PayerAccount,
                    ISNULL(p.Description, RTRIM(ISNULL(z.KAZ_Tresc, '')))  AS Description,
                    ISNULL(p.Confidence, 'None')                           AS Confidence,
-                   ISNULL(p.ContractorId, z.KAZ_KntNumer)                 AS ContractorId,
+                   -- The party on the entry counts only when it really is a contractor. A tax
+                   -- return is booked against an office (KAZ_KNTTyp 4304) and a payroll against
+                   -- an employee (944), and those numbers come from sequences of their own - the
+                   -- II Urząd Skarbowy is number 4, which is also the contractor with acronym
+                   -- "0002". Joined on the number alone, 2183 entries on this register showed
+                   -- somebody else's card.
+                   ISNULL(p.ContractorId,
+                          CASE WHEN z.KAZ_KNTTyp = 32 THEN z.KAZ_KntNumer ELSE 0 END) AS ContractorId,
                    ISNULL(RTRIM(k.Knt_Akronim), '')       AS ContractorAcronym,
                    ISNULL(RTRIM(k.Knt_Nazwa1), '')        AS ContractorName,
                    ISNULL(p.ContractorSource, '')         AS ContractorSource,
@@ -206,10 +217,25 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                    -- full, 'C' in part, 'N' untouched. A penny of difference is rounding, not an
                    -- open item.
                    CASE
+                       WHEN z.KAZ_Rozliczony = 2                             THEN 'X'
                        WHEN z.KAZ_Rozliczony = 1 OR z.KAZ_Pozostaje <= 0.004 THEN 'R'
                        WHEN z.KAZ_Pozostaje < z.KAZ_Kwota - 0.004            THEN 'C'
                        ELSE 'N'
-                   END AS SettlementState
+                   END AS SettlementState,
+                   -- The account in the chart of accounts the entry is posted against. The service
+                   -- fills it in from the contractor's other entries, which is a guess; accounting
+                   -- sees it here and corrects it where the guess was wrong.
+                   RTRIM(ISNULL(z.KAZ_KontoPrzec, '')) AS EntryAccount,
+                   -- Who the entry is booked against when that is not a contractor, so the
+                   -- accountant reads "II URZĄD SKARBOWY" rather than an unrelated acronym.
+                   CASE
+                       WHEN p.ContractorId IS NOT NULL OR z.KAZ_KNTTyp IN (0, 32) THEN ''
+                       WHEN z.KAZ_KNTTyp = 4304 THEN
+                           RTRIM(ISNULL(urz.URZ_Akronim, 'urząd ' + CAST(z.KAZ_KntNumer AS VARCHAR(12))))
+                       WHEN z.KAZ_KNTTyp = 944 THEN
+                           RTRIM(ISNULL(prc.Prc_Akronim, 'pracownik ' + CAST(z.KAZ_KntNumer AS VARCHAR(12))))
+                       ELSE 'podmiot typu ' + CAST(z.KAZ_KNTTyp AS VARCHAR(8))
+                   END AS OtherParty
             FROM CDN.Zapisy AS z
             INNER JOIN CDN.Raporty AS rap
                 ON rap.KRP_GIDNumer = z.KAZ_KRPNumer AND rap.KRP_GIDTyp = z.KAZ_KRPTyp
@@ -222,10 +248,15 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                 ORDER BY q.PaymentId
             ) AS p
             LEFT JOIN CDN.KntKarty AS k
-                ON k.Knt_GIDNumer = ISNULL(p.ContractorId, z.KAZ_KntNumer) AND k.Knt_GIDTyp = 32
+                ON k.Knt_GIDNumer = ISNULL(p.ContractorId,
+                       CASE WHEN z.KAZ_KNTTyp = 32 THEN z.KAZ_KntNumer ELSE 0 END)
+               AND k.Knt_GIDTyp = 32
+            LEFT JOIN CDN.Urzedy AS urz
+                ON z.KAZ_KNTTyp = 4304 AND urz.URZ_GIDNumer = z.KAZ_KntNumer
+            LEFT JOIN CDN.PrcKarty AS prc
+                ON z.KAZ_KNTTyp = 944 AND prc.Prc_GIDNumer = z.KAZ_KntNumer
             WHERE RTRIM(rap.KRP_Seria) IN ({string.Join(", ", seriesParameters)})
               AND rap.KRP_DataOtwarcia >= DATEDIFF(DAY, '1800-12-28', @from)
-              AND z.KAZ_Rozliczony <> 2
             ORDER BY rap.KRP_DataOtwarcia DESC, z.KAZ_Kwota DESC
             """;
 
@@ -252,7 +283,8 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                 reader.GetString(21), reader.GetString(22),
                 reader.GetString(24) == "P", reader.GetString(23),
                 registers.IsCard(reader.GetString(7)), registers.WithoutSettlement(reader.GetString(7)),
-                SettlementStates.Parse(reader.GetString(25))));
+                SettlementStates.Parse(reader.GetString(25)), reader.GetString(26),
+                reader.GetString(27)));
         }
 
         return rows;
@@ -270,7 +302,6 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
             INNER JOIN CDN.Zapisy AS z ON z.KAZ_GIDNumer = p.ErpEntryId
             WHERE p.PostingCategory = 'Standard'
               AND p.BookingDate >= @from
-              AND z.KAZ_Rozliczony <> 2
             """;
 
         var rows = new List<SuggestionRow>();
@@ -308,38 +339,12 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
         var sql = $$"""
             {{DocumentSelect}}
               AND pl.TrP_KntNumer = @knt
-              AND pl.TrP_Rozliczona <> 1
+              AND pl.TrP_Rozliczona IN (0, 2)
               AND pl.TrP_Pozostaje > 0
             ORDER BY pl.TrP_Termin, pl.TrP_GIDNumer
             """;
 
         return ReadDocumentsAsync(sql, token, ("@knt", contractorId));
-    }
-
-    /// <summary>
-    /// Looking a document up by number - the way out when the service named the wrong contractor
-    /// and the accountant has the invoice number from the payment title in front of them.
-    /// </summary>
-    /// <remarks>
-    /// The number is searched for in every header, not only in <c>CDN.TraNag</c> - otherwise
-    /// import invoices, notes, dunning letters and customs documents cannot be found, even though
-    /// we can already show their numbers on the list.
-    /// </remarks>
-    public Task<IReadOnlyList<DocumentRow>> FindDocumentsByNumberAsync(
-        int number, CancellationToken token = default)
-    {
-        var sql = $$"""
-            {{DocumentSelect}}
-              AND @number IN (n.TrN_TrNNumer, imp.ImN_ImNNumer, upo.UPN_Numer,
-                              mem.MEN_Numer, sad.SaN_SaNNumer)
-              AND pl.TrP_Rozliczona <> 1
-              AND pl.TrP_Pozostaje > 0
-            ORDER BY COALESCE(n.TrN_TrNRok, imp.ImN_ImNRok, upo.UPN_Rok,
-                              sad.SaN_SaNRok, mem.MEN_RokMiesiac / 100) DESC
-            OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
-            """;
-
-        return ReadDocumentsAsync(sql, token, ("@number", number));
     }
 
     private async Task<IReadOnlyList<DocumentRow>> ReadDocumentsAsync(
@@ -362,7 +367,7 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                 Convert.ToInt32(reader.GetValue(4)), reader.GetDecimal(5), reader.GetDecimal(6),
                 reader.GetString(7).Trim(), XlDate.ToDateTime(reader.GetInt32(8)),
                 reader.GetInt32(9), reader.GetString(10), reader.GetString(11),
-                reader.GetString(12)));
+                reader.GetString(12), Convert.ToInt32(reader.GetValue(13))));
         }
 
         return rows;
@@ -425,18 +430,31 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
         // stores everything it considers an IBAN without one - Polish accounts included - while
         // the bank sends them with it. Comparing a single form lost the contractor on 133
         // accounts in the register.
-        const string sql = """
+        // Archived accounts are left out, on both sides of the union: they are no longer the
+        // contractor's, and reading them makes the payer ambiguous - see BankAccountSql.
+        //
+        // A retired contractor card is a different matter and is kept: an account is sometimes on
+        // one and on no other. It only loses to a live card holding the same number, which is what
+        // the ordering below does - the caller takes the answer only when it is unambiguous, and
+        // ranking the live cards first is what makes it so.
+        var sql = $"""
+            WITH {BankAccountSql.RetiredAccounts}
             SELECT k.Knt_GIDNumer, RTRIM(k.Knt_Akronim), ISNULL(RTRIM(k.Knt_Nazwa1), ''),
-                   ISNULL(RTRIM(k.Knt_Nip), '')
+                   ISNULL(RTRIM(k.Knt_Nip), ''), ISNULL(k.Knt_Archiwalny, 0) AS Archiwalny
             FROM CDN.KntKarty AS k
             WHERE k.Knt_GIDNumer IN (
                 SELECT RkB_ObiNumer FROM CDN.RachunkiBankowe
                 WHERE RkB_ObiTyp = 32
+                  AND {BankAccountSql.InUse}
                   AND REPLACE(RkB_NrRachunku, ' ', '') IN (@pelny, @bezKraju)
                 UNION
-                SELECT NRB_ObNumer FROM CDN.NumeryRachunkow
-                WHERE NRB_ObTyp = 32
-                  AND REPLACE(NRB_NrRachunkuZnorm, ' ', '') IN (@pelny, @bezKraju))
+                SELECT n.NRB_ObNumer FROM CDN.NumeryRachunkow AS n
+                WHERE n.NRB_ObTyp = 32
+                  AND REPLACE(n.NRB_NrRachunkuZnorm, ' ', '') IN (@pelny, @bezKraju)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wycofane AS w
+                      WHERE w.Knt = n.NRB_ObNumer
+                        AND w.Numer = REPLACE(RTRIM(n.NRB_NrRachunkuZnorm), ' ', '')))
             """;
 
         await using var connection = new SqlConnection(connectionString);
@@ -446,16 +464,24 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
         command.Parameters.AddWithValue("@bezKraju", IbanParts.WithoutCountryCode(account));
 
         var hits = new List<ContractorRow>();
+        var live = new List<ContractorRow>();
 
         await using var reader = await command.ExecuteReaderAsync(token);
         while (await reader.ReadAsync(token))
         {
-            hits.Add(new ContractorRow(
-                reader.GetInt32(0), reader.GetString(1), reader.GetString(2), reader.GetString(3)));
+            var contractor = new ContractorRow(
+                reader.GetInt32(0), reader.GetString(1), reader.GetString(2), reader.GetString(3));
+
+            hits.Add(contractor);
+            if (reader.GetInt16(4) == 0) live.Add(contractor);
         }
 
-        // An account attached to several cards decides nothing - better to suggest nothing.
-        return hits.Count == 1 ? hits[0] : null;
+        // A live card wins over a retired one holding the same number; retired ones still answer
+        // when nothing live does.
+        var candidates = live.Count > 0 ? live : hits;
+
+        // An account attached to several live cards decides nothing - better to suggest nothing.
+        return candidates.Count == 1 ? candidates[0] : null;
     }
 
     /// <summary>
@@ -532,13 +558,180 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
             : null;
     }
 
-    /// <summary>Name, city, postal code and SWIFT of a bank card - to prefill the window.</summary>
+    /// <summary>
+    /// The accounts in the chart of accounts that belong to a contractor, commonest first.
+    /// </summary>
+    /// <remarks>
+    /// Two sources, because neither is enough on its own. <c>CDN.KntKonta</c> is what ERP declares
+    /// for the contractor - 124 380 rows over 34 044 contractors here - but it is kept per
+    /// accounting period and is often left empty in the current one, so a contractor genuinely in
+    /// use can have nothing there. The other source is what their cash entries actually carry,
+    /// which is never empty for anybody who has been paid before, and which is also what the
+    /// service guesses from when it settles.
+    ///
+    /// Ordered by how often an account is used, so the one the automat would have chosen is at the
+    /// top of the list. It matters for the 2 587 contractors here who have more than one - for
+    /// everybody else the list has a single entry and the operator need not think about it.
+    /// </remarks>
+    public async Task<IReadOnlyDictionary<int, IReadOnlyList<string>>> GetContractorAccountsAsync(
+        IReadOnlyCollection<int> contractorIds, CancellationToken token = default)
+    {
+        var wanted = contractorIds.Where(id => id != 0).Distinct().ToList();
+        if (wanted.Count == 0) return new Dictionary<int, IReadOnlyList<string>>();
+
+        // The ids go in as one delimited string rather than as parameters: the queue holds a few
+        // thousand contractors and a command takes at most 2 100 parameters.
+        const string sql = """
+            WITH knt AS (
+                SELECT CAST(value AS INT) AS Knt FROM STRING_SPLIT(@ids, ',')
+            ),
+            uzywane AS (
+                SELECT z.KAZ_KNTNumer AS Knt, RTRIM(z.KAZ_KontoPrzec) AS Konto, COUNT(*) AS Ile
+                FROM CDN.Zapisy AS z
+                INNER JOIN knt ON knt.Knt = z.KAZ_KNTNumer
+                WHERE ISNULL(RTRIM(z.KAZ_KontoPrzec), '') <> ''
+                GROUP BY z.KAZ_KNTNumer, RTRIM(z.KAZ_KontoPrzec)
+            ),
+            zkarty AS (
+                SELECT k.KKT_KntNumer AS Knt, RTRIM(k.KKT_Konto) AS Konto
+                FROM CDN.KntKonta AS k
+                INNER JOIN knt ON knt.Knt = k.KKT_KntNumer
+                WHERE k.KKT_KntTyp = 32 AND ISNULL(RTRIM(k.KKT_Konto), '') <> ''
+                GROUP BY k.KKT_KntNumer, RTRIM(k.KKT_Konto)
+            )
+            SELECT w.Knt, w.Konto
+            FROM (SELECT Knt, Konto FROM uzywane UNION SELECT Knt, Konto FROM zkarty) AS w
+            LEFT JOIN uzywane AS u ON u.Knt = w.Knt AND u.Konto = w.Konto
+            ORDER BY w.Knt, ISNULL(u.Ile, 0) DESC, w.Konto
+            """;
+
+        var accounts = new Dictionary<int, IReadOnlyList<string>>();
+
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(token);
+        await using var command = new SqlCommand(sql, connection) { CommandTimeout = 180 };
+        command.Parameters.AddWithValue("@ids", string.Join(',', wanted));
+
+        await using var reader = await command.ExecuteReaderAsync(token);
+
+        while (await reader.ReadAsync(token))
+        {
+            var contractorId = reader.GetInt32(0);
+
+            if (!accounts.TryGetValue(contractorId, out var list))
+            {
+                list = new List<string>();
+                accounts[contractorId] = list;
+            }
+
+            ((List<string>)list).Add(reader.GetString(1));
+        }
+
+        return accounts;
+    }
+
+    /// <summary>
+    /// What the contractor has paid that nobody has allocated - their overpayment, per currency.
+    /// </summary>
+    /// <remarks>
+    /// Money in, still open, on any register: an incoming cash entry with something left on it and
+    /// no settlement behind it. Entries marked "nie rozliczaj" (<c>KAZ_Rozliczony = 2</c>) are left
+    /// out - somebody has already decided those are not to be matched against anything.
+    ///
+    /// The transfer being worked on is excluded by its own entry. Without that, the money on the
+    /// screen would count itself and every unsettled transfer would look like an overpayment of
+    /// exactly its own amount.
+    /// </remarks>
+    public async Task<IReadOnlyList<ContractorOverpayment>> GetOverpaymentsAsync(
+        int contractorId, int exceptEntryId, CancellationToken token = default)
+    {
+        if (contractorId == 0) return [];
+
+        const string sql = """
+            SELECT RTRIM(z.KAZ_Waluta) AS Waluta, COUNT(*) AS Wplat,
+                   SUM(z.KAZ_Pozostaje) AS Kwota, MIN(rap.KRP_DataOtwarcia) AS Najstarszy
+            FROM CDN.Zapisy AS z
+            INNER JOIN CDN.Raporty AS rap
+                ON rap.KRP_GIDNumer = z.KAZ_KRPNumer AND rap.KRP_GIDTyp = z.KAZ_KRPTyp
+            WHERE z.KAZ_KNTNumer = @knt
+              AND z.KAZ_RP = 2
+              AND z.KAZ_Rozliczony = 0
+              AND z.KAZ_Pozostaje > 0.004
+              AND z.KAZ_GIDNumer <> @except
+            GROUP BY z.KAZ_Waluta
+            ORDER BY SUM(z.KAZ_Pozostaje) DESC
+            """;
+
+        var found = new List<ContractorOverpayment>();
+
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(token);
+        await using var command = new SqlCommand(sql, connection) { CommandTimeout = 60 };
+        command.Parameters.AddWithValue("@knt", contractorId);
+        command.Parameters.AddWithValue("@except", exceptEntryId);
+
+        await using var reader = await command.ExecuteReaderAsync(token);
+
+        while (await reader.ReadAsync(token))
+        {
+            found.Add(new ContractorOverpayment(
+                reader.GetString(0), reader.GetInt32(1), reader.GetDecimal(2),
+                XlDate.ToDateTime(reader.GetInt32(3))));
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// The whole chart of accounts for the current year - account number and name.
+    /// </summary>
+    /// <remarks>
+    /// Read once when the queue is loaded and kept: 41 537 accounts, about a megabyte and a half
+    /// of text, a second to fetch. Per row it would be unthinkable; once a session it is nothing,
+    /// and it is what lets the account picker offer every account rather than only the ones this
+    /// contractor happens to have used before.
+    ///
+    /// The plan is kept per year and month, so the rows are collapsed to one per account number.
+    /// </remarks>
+    public async Task<IReadOnlyList<AccountRow>> GetChartOfAccountsAsync(CancellationToken token = default)
+    {
+        const string sql = """
+            SELECT RTRIM(k.KKS_Konto) AS Konto, MAX(RTRIM(ISNULL(k.KKS_Nazwa, ''))) AS Nazwa
+            FROM CDN.Konta AS k
+            WHERE k.KKS_Rok = (SELECT MAX(KKS_Rok) FROM CDN.Konta)
+              AND RTRIM(k.KKS_Konto) <> ''
+            GROUP BY RTRIM(k.KKS_Konto)
+            ORDER BY RTRIM(k.KKS_Konto)
+            """;
+
+        var accounts = new List<AccountRow>(45000);
+
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(token);
+        await using var command = new SqlCommand(sql, connection) { CommandTimeout = 180 };
+
+        await using var reader = await command.ExecuteReaderAsync(token);
+        while (await reader.ReadAsync(token)) accounts.Add(new AccountRow(reader.GetString(0), reader.GetString(1)));
+
+        return accounts;
+    }
+
+    /// <summary>The accounts of one contractor - after the operator swapped who the transfer is with.</summary>
+    public async Task<IReadOnlyList<string>> GetContractorAccountsAsync(
+        int contractorId, CancellationToken token = default)
+    {
+        var found = await GetContractorAccountsAsync([contractorId], token);
+        return found.TryGetValue(contractorId, out var accounts) ? accounts : [];
+    }
+
+    /// <summary>Name, address and SWIFT of a bank card - to prefill the window.</summary>
     public async Task<BankDetails?> GetBankAsync(int bankId, CancellationToken token = default)
     {
         const string sql = """
             SELECT ISNULL(RTRIM(Bnk_Swift), ''), ISNULL(RTRIM(Bnk_Nazwa), ''),
-                   ISNULL(RTRIM(Bnk_Miasto), ''), ISNULL(RTRIM(Bnk_KodP), ''),
-                   ISNULL(RTRIM(Bnk_KodKraju), ''), ISNULL(RTRIM(Bnk_Numer), '')
+                   ISNULL(RTRIM(Bnk_Ulica), ''), ISNULL(RTRIM(Bnk_Miasto), ''),
+                   ISNULL(RTRIM(Bnk_KodP), ''), ISNULL(RTRIM(Bnk_KodKraju), ''),
+                   ISNULL(RTRIM(Bnk_Numer), '')
             FROM CDN.Banki WHERE Bnk_GIDNumer = @bank
             """;
 
@@ -551,8 +744,8 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
 
         return await reader.ReadAsync(token)
             ? new BankDetails(
-                reader.GetString(0), reader.GetString(1), reader.GetString(2),
-                reader.GetString(3), reader.GetString(4), reader.GetString(5))
+                reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3),
+                reader.GetString(4), reader.GetString(5), reader.GetString(6))
             : null;
     }
 
@@ -572,6 +765,10 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
     public async Task<IReadOnlySet<(int ContractorId, string Account)>> ContractorsWithAccountAsync(
         IReadOnlyList<(int ContractorId, string Account)> pairs, CancellationToken token = default)
     {
+        // Archived accounts count here, and only here. The question this answers is not "whose
+        // account is this" but "is this number already on the card" - and XLNowyRachunek refuses a
+        // number that is there, archived or not. Filtering them out would show the operator an
+        // "add account" button that fails every time they press it.
         const string sql = """
             SELECT COUNT(*)
             FROM CDN.RachunkiBankowe
@@ -615,12 +812,13 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
     public async Task<IReadOnlyList<string>> AccountsWithoutBankAsync(
         IReadOnlyList<(int ContractorId, string Account)> pairs, CancellationToken token = default)
     {
-        const string sql = """
+        var sql = $"""
             SELECT COUNT(*)
             FROM CDN.RachunkiBankowe
             WHERE RkB_ObiTyp = 32
               AND RkB_ObiNumer = @knt
               AND ISNULL(RkB_BnkNumer, 0) = 0
+              AND {BankAccountSql.InUse}
               AND REPLACE(RTRIM(RkB_NrRachunku), ' ', '') IN (@pelny, @bezKraju)
             """;
 

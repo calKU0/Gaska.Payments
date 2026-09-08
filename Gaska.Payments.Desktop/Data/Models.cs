@@ -1,4 +1,4 @@
-namespace Gaska.Payments.Desktop.Data;
+﻿namespace Gaska.Payments.Desktop.Data;
 
 /// <summary>A transfer awaiting settlement - the ERP bank entry plus what the service knows about it.</summary>
 public sealed record PaymentRow(
@@ -38,7 +38,19 @@ public sealed record PaymentRow(
     /// Such registers enter the filter unchecked.
     /// </summary>
     bool WithoutSettlement,
-    SettlementState SettlementState);
+    SettlementState SettlementState,
+    /// <summary>
+    /// The account in the chart of accounts the entry is posted against (<c>KAZ_KontoPrzec</c>).
+    /// Empty when nobody has set one - which is what an entry posted on the anonymous party looks
+    /// like until it is settled.
+    /// </summary>
+    string EntryAccount,
+    /// <summary>
+    /// The party the entry is booked against when it is not a contractor - a tax office or an
+    /// employee. Empty for everything the application can settle; when it is filled in, the
+    /// transfer is shown but left alone, because settlement in XL only knows contractors.
+    /// </summary>
+    string OtherParty);
 
 /// <summary>An open document payment in ERP.</summary>
 /// <param name="PaymentType">1 is a liability, 2 a receivable.</param>
@@ -56,8 +68,18 @@ public sealed record DocumentRow(
     int ContractorId,
     string ContractorAcronym,
     string Symbol,
-    string ForeignNumber)
+    string ForeignNumber,
+    /// <summary>
+    /// <c>TrP_Rozliczona</c> as ERP holds it: 0 open, 1 settled, 2 the "nie rozliczaj" box.
+    /// </summary>
+    int SettlementFlag)
 {
+    /// <summary>
+    /// Whether the payment carries ERP's "nie rozliczaj" flag - the accountants' own decision
+    /// that this open item is never going to be pursued.
+    /// </summary>
+    public bool DoNotSettle => SettlementFlag == 2;
+
     /// <summary>
     /// The signed amount, in the engine's convention: a receivable is positive, the opposite side
     /// negative. The engine nets opposite sides off against receivables, so the sign has to be
@@ -83,6 +105,28 @@ public sealed record SuggestionRow(
     decimal Amount,
     double Score,
     string Reason);
+
+/// <summary>
+/// Money from a contractor sitting in ERP against nothing - a payment nobody has allocated.
+/// </summary>
+/// <param name="Oldest">
+/// The day of the oldest of them. Some go back years, and that is worth seeing: an overpayment
+/// from 2011 is a different conversation from one from last week.
+/// </param>
+public sealed record ContractorOverpayment(string Currency, int Count, decimal Amount, DateTime Oldest);
+
+/// <summary>One account of the chart of accounts.</summary>
+public sealed record AccountRow(string Account, string Name);
+
+/// <summary>An account as the picker offers it.</summary>
+/// <param name="Contractors">
+/// Whether it is one this contractor is settled to. Those head the list and are marked, because
+/// one of them is nearly always the answer.
+/// </param>
+public sealed record AccountOption(string Account, string Name, bool Contractors)
+{
+    public string Display => Name.Length > 0 ? $"{Account} · {Name}" : Account;
+}
 
 /// <summary>A contractor from the register - for swapping by hand when the service named the wrong one.</summary>
 public sealed record ContractorRow(int Id, string Acronym, string Name, string Nip)

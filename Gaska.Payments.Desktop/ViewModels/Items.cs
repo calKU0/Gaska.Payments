@@ -1,5 +1,6 @@
-using System.Collections.ObjectModel;
+﻿using System.Collections.ObjectModel;
 using System.Linq;
+using System.Windows.Input;
 using Gaska.Payments.Desktop.Data;
 using Gaska.Payments.Desktop.Mvvm;
 
@@ -9,7 +10,10 @@ namespace Gaska.Payments.Desktop.ViewModels;
 public sealed class DocumentItem(
     DocumentRow row, bool suggested, bool paymentIsIncoming) : ObservableObject
 {
-    private bool _isSelected = suggested;
+    // A hint on a payment somebody has since flagged "nie rozliczaj" is stale: the badge still
+    // says the service matched it, but it does not arrive ticked - settling it would undo a
+    // decision already made in ERP.
+    private bool _isSelected = suggested && !row.DoNotSettle;
 
     public DocumentRow Row { get; } = row;
 
@@ -23,9 +27,53 @@ public sealed class DocumentItem(
 
     public event Action? SelectionChanged;
 
+    private bool _doNotSettle = row.DoNotSettle;
+
+    /// <summary>
+    /// ERP's "nie rozliczaj" box on this payment. Ticking it says the open item is never going to
+    /// be pursued; the transfer in hand cannot then be settled against it, so the tick clears the
+    /// selection along with it.
+    /// </summary>
+    public bool DoNotSettle
+    {
+        get => _doNotSettle;
+        set
+        {
+            if (!Set(ref _doNotSettle, value)) return;
+
+            if (value) IsSelected = false;
+
+            Raise(nameof(SettlementState));
+            DoNotSettleChanged?.Invoke(this);
+        }
+    }
+
+    /// <summary>Raised when the box is ticked or cleared, so the change reaches ERP.</summary>
+    public event Action<DocumentItem>? DoNotSettleChanged;
+
+    /// <summary>Puts the box back without writing anything - for when the write failed.</summary>
+    public void ResetDoNotSettle(bool value)
+    {
+        _doNotSettle = value;
+        Raise(nameof(DoNotSettle));
+        Raise(nameof(SettlementState));
+    }
+
     public string DocNumber => Row.DocNumber;
 
     public string Kind => Row.IsLiability ? "zobowiązanie" : "należność";
+
+    /// <summary>
+    /// How far this open item is settled, in the same words the queue uses.
+    /// </summary>
+    /// <remarks>
+    /// Fully settled payments are never loaded (they have nothing left on them), so only three of
+    /// the four states can occur here.
+    /// </remarks>
+    public SettlementState SettlementState =>
+        DoNotSettle ? Data.SettlementState.DoNotSettle
+        : Row.Remaining < Row.Amount - 0.004m ? Data.SettlementState.Partial
+        : Data.SettlementState.Unsettled;
 
     public string Symbol => Row.Symbol;
 
@@ -122,9 +170,32 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
     /// does not hold one - a day the bank sent no statement, or a report from before the archive
     /// existed.
     /// </summary>
-    public string? SourceDocument { get; set; }
+    private string? _sourceDocument;
+
+    public string? SourceDocument
+    {
+        get => _sourceDocument;
+        set
+        {
+            if (!Set(ref _sourceDocument, value)) return;
+
+            Raise(nameof(HasSourceDocument));
+            CommandManager.InvalidateRequerySuggested();
+        }
+    }
 
     public bool HasSourceDocument => SourceDocument is { Length: > 0 };
+
+    /// <summary>
+    /// Looks in the archive again for the file behind this entry.
+    /// </summary>
+    /// <remarks>
+    /// Done on entering the row, not only when the queue is loaded. Today's statement is written
+    /// during the day - the service replaces it every pass as more transfers arrive - so a
+    /// transfer booked this morning has no file when the queue is opened and has one an hour
+    /// later. Without this the button stayed missing until somebody pressed Refresh.
+    /// </remarks>
+    public void RefreshSourceDocument(Func<PaymentRow, string?> find) => SourceDocument = find(Row);
 
     /// <summary>What the button that opens it says - a statement is not a payout report.</summary>
     public string SourceDocumentLabel =>
@@ -154,6 +225,7 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
     {
         "NoCandidates" => "brak kandydatów",
         "ExplicitReferencesExactSum" => "numery z tytułu, kwota zgodna",
+        "ExplicitReferencesRounding" => "numery z tytułu, różnica groszowa",
         "ExplicitReferencesPartial" => "numery z tytułu, kwota inna",
         "SingleDocumentPartialPayment" => $"jeden dokument, {DirectionLabel} częściowa",
         "SubsetSumOnContractor" => $"zestaw {SideLabel} kontrahenta",
@@ -164,9 +236,10 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
     };
 
     /// <summary>The acronym alone - for the narrow column in the grid.</summary>
-    public string ContractorAcronym => Row.ContractorId != 0
-        ? Row.ContractorAcronym
-        : ResolvedAcronym ?? "—";
+    public string ContractorAcronym => ResolvedAcronym
+        ?? (Row.ContractorId != 0
+            ? Row.ContractorAcronym
+            : Row.OtherParty.Length > 0 ? Row.OtherParty : "—");
 
     /// <summary>Acronym of the contractor found from the counterparty account.</summary>
     public string? ResolvedAcronym { get; private set; }
@@ -187,6 +260,22 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
     public int EffectiveContractorId { get; private set; } = row.ContractorId;
 
     /// <summary>
+    /// The contractor on the transfer as an entry the picker can show, or null when there is none.
+    /// </summary>
+    /// <remarks>
+    /// The drop-down can only display what is in its list, so the one already in force has to be
+    /// in it - before anything has been searched for, it is the only entry there is. The NIP is
+    /// not carried on the transfer and is left empty; nothing on this list is matched by it.
+    /// </remarks>
+    public ContractorRow? CurrentContractor => EffectiveContractorId == 0
+        ? null
+        : new ContractorRow(
+            EffectiveContractorId,
+            ResolvedAcronym ?? Row.ContractorAcronym,
+            ResolvedAcronym is null ? Row.ContractorName : string.Empty,
+            string.Empty);
+
+    /// <summary>
     /// Whether the counterparty account is already on the contractor's card.
     /// </summary>
     /// <remarks>
@@ -201,6 +290,158 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
 
     /// <summary>Records that the account reached the named contractor's card.</summary>
     public void MarkAccountAssigned() => SetAccountKnown(true);
+
+    // ------------------------------------- the account the entry is posted against ---
+
+    private string? _selectedAccount = row.EntryAccount.Length > 0 ? row.EntryAccount : null;
+
+    /// <summary>
+    /// The account in the chart of accounts this transfer will be settled to, chosen from the
+    /// contractor's accounts.
+    /// </summary>
+    /// <remarks>
+    /// Nothing is written to ERP when this changes. The account reaches the cash entry at the
+    /// moment the transfer is settled, in the same breath as the party - a settlement and the
+    /// account it is booked to are one decision, and splitting them into two buttons invited an
+    /// account saved against a settlement that never happened.
+    /// </remarks>
+    public string? SelectedAccount
+    {
+        get => _selectedAccount;
+        set
+        {
+            // The picker offers no empty entry, so "nothing" never comes from the operator - it
+            // comes from the drop-down losing its selection while the list underneath it is
+            // rebuilt for another contractor. Taking that would wipe the account the settlement is
+            // going to use, and it did: an entry with 203-AGROTAKA on it came out blank in both
+            // the column and the picker.
+            if (string.IsNullOrWhiteSpace(value) && !string.IsNullOrWhiteSpace(_selectedAccount)) return;
+
+            Set(ref _selectedAccount, value);
+        }
+    }
+
+    /// <summary>
+    /// Says the account again, without changing it.
+    /// </summary>
+    /// <remarks>
+    /// Rebuilding the picker's list drops the drop-down's own selection, and nothing pushes the
+    /// value back afterwards - the model has not changed, so the binding stays quiet and the
+    /// control shows an empty box over a column that reads correctly. Raising the change once the
+    /// new list is in place is what makes it resolve again.
+    /// </remarks>
+    public void RefreshSelectedAccount() => Raise(nameof(SelectedAccount));
+
+    /// <summary>
+    /// The accounts belonging to the contractor this transfer is settled with, commonest first.
+    /// </summary>
+    /// <remarks>
+    /// It is not read off the contractor's card: for all 200 multi-account contractors checked
+    /// here <c>CDN.KntKonta</c> declares nothing in any period, so what their entries actually use
+    /// is the only evidence there is. The picker puts these at the head of the whole chart of
+    /// accounts.
+    /// </remarks>
+    public IReadOnlyList<string> ContractorAccounts { get; private set; } = [];
+
+    /// <summary>
+    /// Whether the account may be chosen at all. It may not until a contractor is established -
+    /// the account is booked against the party, and without one the choice would mean nothing.
+    /// </summary>
+    public bool CanChooseAccount => EffectiveContractorId != 0;
+
+    /// <summary>Whose accounts the list currently holds - so it is not fetched twice.</summary>
+    public int AccountOptionsFor { get; private set; }
+
+    /// <summary>
+    /// The account to book the settlement against - empty while the picker is showing somebody
+    /// else's.
+    /// </summary>
+    /// <remarks>
+    /// Highlighting a contractor in the hit list puts their accounts on the picker before anything
+    /// is committed. Settling at that moment would post the entry against the contractor still on
+    /// it and an account belonging to the one merely being looked at. Empty here means the
+    /// statement falls back to the account this contractor's own entries carry, which is right.
+    /// </remarks>
+    public string AccountForSettlement =>
+        AccountOptionsFor == EffectiveContractorId ? SelectedAccount ?? string.Empty : string.Empty;
+
+    // ------------------------------------------- what the contractor has overpaid ---
+
+    private IReadOnlyList<ContractorOverpayment> _overpayments = [];
+
+    /// <summary>
+    /// Money from this contractor that ERP holds against nothing, per currency.
+    /// </summary>
+    /// <remarks>
+    /// Shown beside the totals under the documents, because it changes what the accountant does:
+    /// a transfer that does not cover the invoices may be meant to be topped up from an
+    /// overpayment already sitting there, and without this they would have to go looking in ERP to
+    /// find out.
+    /// </remarks>
+    public IReadOnlyList<ContractorOverpayment> Overpayments
+    {
+        get => _overpayments;
+        set
+        {
+            _overpayments = value;
+
+            Raise(nameof(Overpayments));
+            Raise(nameof(HasOverpayment));
+            Raise(nameof(OverpaymentAmount));
+            Raise(nameof(OverpaymentDetail));
+        }
+    }
+
+    /// <summary>The overpayment in this transfer's own currency - the one worth comparing.</summary>
+    public decimal OverpaymentAmount =>
+        _overpayments.FirstOrDefault(o => o.Currency == Currency)?.Amount ?? 0m;
+
+    public bool HasOverpayment => _overpayments.Count > 0;
+
+    /// <summary>How many payments it is made of, how old, and what is in other currencies.</summary>
+    public string OverpaymentDetail
+    {
+        get
+        {
+            if (_overpayments.Count == 0) return "brak nierozliczonych wpłat";
+
+            var mine = _overpayments.FirstOrDefault(o => o.Currency == Currency);
+            var others = _overpayments.Where(o => o.Currency != Currency).ToList();
+
+            var text = mine is null
+                ? "nic w walucie przelewu"
+                : $"{mine.Count} {Payments(mine.Count)}, najstarsza {mine.Oldest:dd.MM.yyyy}";
+
+            return others.Count == 0
+                ? text
+                : $"{text}; poza tym {string.Join(", ", others.Select(o => $"{o.Amount:N2} {o.Currency}"))}";
+        }
+    }
+
+    private static string Payments(int count) => count == 1 ? "wpłata" : count is >= 2 and <= 4 ? "wpłaty" : "wpłat";
+
+    public void SetAccountOptions(IReadOnlyList<string> accounts, int contractorId)
+    {
+        AccountOptionsFor = contractorId;
+        ContractorAccounts = accounts;
+
+        // The account on the entry counts only while these options belong to the party the entry
+        // is actually booked against. Once the operator swaps the contractor it is the previous
+        // one's account and must not follow them over - the new contractor's commonest is the
+        // honest default, and it is the one the settlement would pick anyway.
+        var ours = contractorId == Row.ContractorId ? Row.EntryAccount : string.Empty;
+
+        // Assigned to the field, not through the property: the property refuses to be emptied,
+        // which is what stops the drop-down clobbering it, and here the model itself is deciding.
+        _selectedAccount =
+            accounts.FirstOrDefault(a => string.Equals(a, ours, StringComparison.OrdinalIgnoreCase))
+            ?? accounts.FirstOrDefault()
+            ?? (ours.Length > 0 ? ours : null);
+
+        Raise(nameof(SelectedAccount));
+        Raise(nameof(ContractorAccounts));
+        Raise(nameof(CanChooseAccount));
+    }
 
     /// <summary>
     /// Sets the account state as verified against the ERP register.
@@ -218,28 +459,6 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
         Raise(nameof(CanAssignAccount));
     }
 
-    /// <summary>
-    /// Whether the operator swapped the contractor by hand - if so, the service's own answer can
-    /// be restored.
-    /// </summary>
-    public bool ContractorOverridden { get; private set; }
-
-    /// <summary>Restores the contractor and documents to the shape the service established.</summary>
-    public void RestoreServiceContractor()
-    {
-        ContractorOverridden = false;
-        AccountKnown = Row.ContractorFromBankAccount;
-        EffectiveContractorId = Row.ContractorId;
-        ResolvedAcronym = null;
-        ResolvedContractor = null;
-
-        Raise(nameof(ContractorAcronym));
-        Raise(nameof(ContractorSourceLabel));
-        Raise(nameof(AccountKnown));
-        Raise(nameof(CanAssignAccount));
-        Raise(nameof(ContractorOverridden));
-    }
-
     /// <summary>Remembers the contractor named by the account or by the operator.</summary>
     /// <param name="byOperator">
     /// True when a human chose the contractor. The account is then absent from the register -
@@ -247,23 +466,34 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
     /// </param>
     public void UseContractor(int id, string acronym, string display, bool byOperator = false)
     {
-        ContractorOverridden = byOperator;
         if (!byOperator) AccountKnown = true;
-        Raise(nameof(ContractorOverridden));
         EffectiveContractorId = id;
         ResolvedAcronym = acronym;
         ResolvedContractor = display;
         Raise(nameof(ContractorAcronym));
+        Raise(nameof(ContractorDisplay));
+        Raise(nameof(CurrentContractor));
         Raise(nameof(ContractorSourceLabel));
         Raise(nameof(AccountKnown));
         Raise(nameof(CanAssignAccount));
+        Raise(nameof(CanChooseAccount));
     }
 
-    public string ContractorDisplay => Row.ContractorId == 0
-        ? ResolvedContractor ?? "nierozpoznany"
-        : string.IsNullOrEmpty(Row.ContractorName)
-            ? Row.ContractorAcronym
-            : $"{Row.ContractorAcronym} — {Row.ContractorName}";
+    /// <summary>
+    /// Whether the entry is booked against something other than a contractor - a tax office or an
+    /// employee. Nothing here can settle such an entry: XL settles contractor open items, and both
+    /// the party update and <c>XLRozliczaj</c> take the party for a contractor.
+    /// </summary>
+    public bool IsOtherParty => Row.OtherParty.Length > 0;
+
+    public string ContractorDisplay => ResolvedContractor
+        ?? (Row.OtherParty.Length > 0
+            ? $"{Row.OtherParty} — nie kontrahent"
+            : Row.ContractorId == 0
+                ? "nierozpoznany"
+                : string.IsNullOrEmpty(Row.ContractorName)
+                    ? Row.ContractorAcronym
+                    : $"{Row.ContractorAcronym} — {Row.ContractorName}");
 
     /// <summary>How we know the contractor - the accountant has to see whether the evidence is solid.</summary>
     public string ContractorSourceLabel => Row.ContractorId != 0
@@ -302,7 +532,8 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
     public string SettlementLabel => Row.SettlementState.Describe();
 
     /// <summary>Whether there is anything on the entry to revoke.</summary>
-    public bool HasSettlements => Row.SettlementState != SettlementState.Unsettled;
+    public bool HasSettlements =>
+        Row.SettlementState is SettlementState.Partial or SettlementState.Settled;
 
     /// <summary>
     /// Whether the transfer can be marked as not subject to settlement.
@@ -312,7 +543,11 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
     /// matched part of the amount to something that is untrue - the settlement has to be revoked
     /// first.
     /// </remarks>
-    public bool CanMarkDoNotSettle => Row.SettlementState == SettlementState.Unsettled;
+    public bool CanMarkDoNotSettle =>
+        Row.SettlementState is SettlementState.Unsettled or SettlementState.DoNotSettle;
+
+    /// <summary>Whether ERP already holds this transfer as not subject to settlement.</summary>
+    public bool IsDoNotSettle => Row.SettlementState == SettlementState.DoNotSettle;
 
     /// <summary>On money in the counterparty is the sender, on money out the recipient.</summary>
     public string PartyLabel => Row.IsIncoming ? "Nadawca" : "Odbiorca";

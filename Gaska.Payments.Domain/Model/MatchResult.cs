@@ -23,6 +23,12 @@ public enum MatchStrategy
     /// <summary>Documents named in the title, their sum equal to the amount received.</summary>
     ExplicitReferencesExactSum,
 
+    /// <summary>
+    /// Documents named in the title, their sum apart from the amount by a few groszy - a rounding
+    /// difference, not a different set of documents.
+    /// </summary>
+    ExplicitReferencesRounding,
+
     /// <summary>Documents named in the title, but the sum differs from the amount (over-, under- or part payment).</summary>
     ExplicitReferencesPartial,
 

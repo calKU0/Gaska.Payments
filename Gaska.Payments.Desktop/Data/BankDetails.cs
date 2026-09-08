@@ -8,9 +8,14 @@ namespace Gaska.Payments.Desktop.Data;
 /// The bank code taken out of the account number - it is by this, and by this alone, that Comarch
 /// ERP XL ties a bank to an account. See <see cref="IbanParts"/>.
 /// </param>
+/// <param name="Street">
+/// The branch's street. Optional - ERP does not need it to tie a bank to an account, but the
+/// accountants print it on transfer orders, and a card without it has to be completed by hand.
+/// </param>
 public sealed record BankDetails(
     string Bic,
     string Name,
+    string Street,
     string City,
     string PostalCode,
     string CountryCode,

@@ -1,4 +1,4 @@
-using System.Windows.Controls.Primitives;
+﻿using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows;
 
@@ -17,6 +17,11 @@ namespace Gaska.Payments.Desktop.Mvvm;
 /// anywhere outside reaches us instead of the button. We close the list and the button never sees
 /// the click, so it cannot reopen it. Presses inside the list still work normally, because the
 /// capture covers the whole subtree.
+///
+/// The capture has to be held until the press has finished routing. The outside-press handler runs
+/// on a preview of that press, so giving the capture back inside it hands the very same press to
+/// the button, which checks itself again - the symptom the capture was there to prevent. It is
+/// released when the popup closes instead.
 ///
 /// The capture goes on the popup's <see cref="Popup.Child"/>, not on the popup itself: a popup is
 /// only a placeholder in its parent's tree and its content lives in a window of its own, so
@@ -96,11 +101,11 @@ public static class DropdownPopup
     {
         if (sender is not UIElement content) return;
 
-        // The capture is released here rather than being left to Closed alone: the popup raises
-        // that event a dispatcher pass later, and until then the whole application would be
-        // holding a capture it no longer wants.
-        Release(content);
-
+        // The capture is deliberately NOT released here. Releasing it first was the whole bug:
+        // this notification is only a preview of a press that has not been routed yet, so with
+        // the capture gone the press went on to the toggle button, which checked itself again and
+        // the list reopened - the second click looked like it did nothing. While the capture is
+        // still ours the press has nowhere else to go. Closed gives it back a moment later.
         if (GetToggle(content) is { } toggle) toggle.IsChecked = false;
     }
 }

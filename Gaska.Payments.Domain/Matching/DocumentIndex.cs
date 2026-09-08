@@ -193,11 +193,20 @@ public sealed class DocumentIndex
     public IReadOnlyList<OpenReceivable> All => _all;
 
     /// <summary>Records a bank account to contractor link (CDN.RachunkiBankowe).</summary>
+    /// <remarks>
+    /// The same contractor is registered only once per account, however many times the register
+    /// spells it. ERP keeps one account in two places and in two forms - <c>RachunkiBankowe</c>
+    /// without the country code, <c>NumeryRachunkow</c> with it - and both normalise to the same
+    /// key here. Added twice, the account looked as though it hung on two cards, and an account
+    /// on two cards names nobody: the payment lost its contractor and the note said, absurdly,
+    /// that it belonged to "2 kartotek (KOM-BELT, KOM-BELT)". It affects 149 accounts in this
+    /// register.
+    /// </remarks>
     public void RegisterContractorAccount(string account, int contractorId)
     {
         var key = TextNormalizer.NormalizeAccount(account);
         if (key.Length < 10) return;
-        Add(_contractorByAccount, key, contractorId);
+        AddDistinct(_contractorByAccount, key, contractorId);
     }
 
     /// <summary>Records a tax id to contractor link (CDN.KntKarty).</summary>
@@ -205,7 +214,7 @@ public sealed class DocumentIndex
     {
         var key = TextNormalizer.DigitsOnly(nip);
         if (key.Length < 8) return;
-        Add(_contractorByNip, key, contractorId);
+        AddDistinct(_contractorByNip, key, contractorId);
     }
 
     /// <summary>Card acronyms - so that a justification can name specific contractors.</summary>
@@ -319,10 +328,34 @@ public sealed class DocumentIndex
                bucket.Distinct().Count() == 1;
     }
 
+    /// <summary>Contractor cards ERP marks as archived - retired, kept for the old documents.</summary>
+    private readonly HashSet<int> _archivedContractors = [];
+
+    public void RegisterContractorArchived(int contractorId) => _archivedContractors.Add(contractorId);
+
+    /// <summary>
+    /// The contractors this account belongs to - the live ones where there are any.
+    /// </summary>
+    /// <remarks>
+    /// An account left on a retired card does not make the payer ambiguous. A transfer to
+    /// 86114011240000345094001001 named nobody because the number sits on SCHENKER and also on
+    /// SPEDPOL, a card archived years ago when the one company absorbed the other; two cards means
+    /// "cannot tell", so the payee was lost.
+    ///
+    /// Preferred rather than filtered out, and that distinction is the whole point: on this
+    /// register 117 accounts hang on an archived card and on no other, and dropping archived cards
+    /// outright would lose every one of them to gain the 27 collisions this resolves. Falling back
+    /// to them when nothing live holds the account keeps both.
+    /// </remarks>
     public IReadOnlyList<int> FindContractorsByAccount(string? account)
     {
         var key = TextNormalizer.NormalizeAccount(account);
-        return key.Length >= 10 && _contractorByAccount.TryGetValue(key, out var list) ? list : [];
+
+        if (key.Length < 10 || !_contractorByAccount.TryGetValue(key, out var list)) return [];
+        if (list.Count < 2 || _archivedContractors.Count == 0) return list;
+
+        var live = list.Where(id => !_archivedContractors.Contains(id)).ToList();
+        return live.Count > 0 ? live : list;
     }
 
     public IReadOnlyList<int> FindContractorsByNip(string? nip)
@@ -500,5 +533,26 @@ public sealed class DocumentIndex
             map[key] = list;
         }
         list.Add(value);
+    }
+
+    /// <summary>
+    /// As <see cref="Add{TKey,T}"/>, but a value already under that key is not repeated.
+    /// </summary>
+    /// <remarks>
+    /// For the maps whose length is read as evidence - one contractor under an account means the
+    /// payer is known, two mean nobody is - a repeat is not a second contractor and must not count
+    /// as one. The lists are short (an account or a tax id belongs to one card, rarely a handful),
+    /// so scanning them costs nothing.
+    /// </remarks>
+    private static void AddDistinct<TKey, T>(Dictionary<TKey, List<T>> map, TKey key, T value)
+        where TKey : notnull
+    {
+        if (!map.TryGetValue(key, out var list))
+        {
+            map[key] = [value];
+            return;
+        }
+
+        if (!list.Contains(value)) list.Add(value);
     }
 }

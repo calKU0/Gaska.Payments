@@ -1,3 +1,4 @@
+using Gaska.Payments.Erp.Posting;
 using Microsoft.Data.SqlClient;
 
 namespace Gaska.Payments.Application.Posting;
@@ -34,6 +35,28 @@ public sealed class PostingJournal(string connectionString)
     public void MarkSettled(long paymentId) => Execute(
         "UPDATE pay.Payment SET Status = 'Posted', SettledAt = SYSDATETIME() WHERE PaymentId = @id",
         ("@id", paymentId));
+
+    /// <summary>
+    /// Puts the party the open items were closed with onto the cash entry, with its contra
+    /// account. Does nothing when the entry already names that party.
+    /// </summary>
+    /// <remarks>
+    /// The same statement the accounting application runs when an operator settles by hand - an
+    /// entry must end up the same whoever settled it. See <see cref="CashEntrySql"/>.
+    /// </remarks>
+    public void UpdateEntryContractor(
+        long paymentId, int entryId, int contractorId, string account = "") => Execute(
+        CashEntrySql.SetEntryContractor,
+        ("@contractor", contractorId), ("@entry", entryId), ("@paymentId", paymentId),
+        ("@konto", account));
+
+    /// <summary>
+    /// Writes the numbers of the settled documents onto the entry, in place of the bank's
+    /// reference. See <see cref="CashEntrySql.SetEntryDocumentNumber"/>.
+    /// </summary>
+    public void UpdateEntryDocumentNumber(int entryId, IReadOnlyList<string> documentNumbers) => Execute(
+        CashEntrySql.SetEntryDocumentNumber,
+        ("@entry", entryId), ("@numer", CashEntrySql.NumberFor(documentNumbers)));
 
     private void Execute(string sql, params (string Name, object Value)[] parameters)
     {

@@ -227,6 +227,9 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
         {
             MatchStrategy.ExplicitReferencesExactSum =>
                 $"Dokumenty wskazane w tytule ({documents}) sumują się dokładnie do kwoty operacji.",
+            MatchStrategy.ExplicitReferencesRounding =>
+                $"Wszystkie dokumenty wskazane w tytule ({documents}); ich suma różni się od kwoty "
+                + "operacji o grosze – to różnica zaokrągleń.",
             MatchStrategy.ExplicitReferencesPartial =>
                 $"Dokumenty wskazane w tytule ({documents}), ale ich suma różni się od kwoty operacji.",
             MatchStrategy.SingleDocumentPartialPayment =>
@@ -505,6 +508,30 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
             }
         }
 
+        // 2a. The named documents come to within a few groszy of the amount. That is a rounding
+        //     difference, not a different set of documents: every number in the title was found,
+        //     and no other reading of the title is available. Proposing them and leaving the few
+        //     groszy unallocated beats every fallback below, all of which answer a question the
+        //     customer did not ask.
+        var difference = target - signedSum;
+
+        if (Math.Abs(difference) <= _options.ReferenceSumTolerance && explicitHits.Count > 1)
+        {
+            var allocations = explicitHits
+                .Select(h => new MatchAllocation(h.Receivable, h.Receivable.SignedRemaining, h.Score, h.Reason))
+                .ToList();
+
+            notes.Add(
+                $"Suma dokumentów z tytułu ({signedSum:N2}) różni się od kwoty " +
+                $"{KindOf(payment.IsIncoming)} ({target:N2}) o {Math.Abs(difference):N2} – " +
+                "różnica groszowa, przypisano wszystkie wskazane dokumenty.");
+
+            // Never certain enough for the automat: the amount no longer confirms the reading of
+            // the title, so a human looks at it. But it is a proposal to accept, not a hint.
+            return new AllocationOutcome(
+                MatchConfidence.Medium, MatchStrategy.ExplicitReferencesRounding, allocations);
+        }
+
         // 3. One named document, the payment covering part of it - common with instalments.
         if (explicitHits.Count == 1)
         {
@@ -594,13 +621,36 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
             }
         }
 
-        // 6. Nothing balances - spread the amount over the named documents, oldest first.
-        var greedy = AllocateGreedy(explicitHits.Select(h => (h.Receivable, h.Score, h.Reason)).ToList(), target);
+        // 6. Nothing balances - spread the amount over the named documents, oldest first, with the
+        //    corrections named alongside them netted off first. A correction the customer quoted
+        //    is part of what they are settling; dropping it and part-paying an invoice instead
+        //    invents a debt they never claimed to be leaving unpaid.
+        var namedCorrections = explicitHits
+            .Where(h => h.Receivable.IsCorrection)
+            .Select(h => new MatchAllocation(h.Receivable, h.Receivable.SignedRemaining, h.Score, h.Reason))
+            .ToList();
+
+        var toSpread = target - namedCorrections.Sum(a => a.Amount);
+
+        var greedy = AllocateGreedy(
+            explicitHits.Where(h => !h.Receivable.IsCorrection)
+                .Select(h => (h.Receivable, h.Score, h.Reason)).ToList(),
+            toSpread);
+
         if (greedy.Count > 0)
         {
             notes.Add($"Kwota {KindOf(payment.IsIncoming)} ({target:N2}) nie zgadza się z sumą " +
                       $"wskazanych dokumentów ({signedSum:N2}) – propozycja rozksięgowania od najstarszego.");
-            return new AllocationOutcome(MatchConfidence.Low, MatchStrategy.ExplicitReferencesPartial, greedy);
+
+            if (namedCorrections.Count > 0)
+            {
+                notes.Add($"Korekty z tytułu przelewu ({namedCorrections.Sum(a => -a.Amount):N2}) " +
+                          "odjęto przed rozksięgowaniem.");
+            }
+
+            return new AllocationOutcome(
+                MatchConfidence.Low, MatchStrategy.ExplicitReferencesPartial,
+                [.. namedCorrections, .. greedy]);
         }
 
         return null;

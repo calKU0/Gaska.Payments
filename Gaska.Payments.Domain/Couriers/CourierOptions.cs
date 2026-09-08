@@ -64,9 +64,15 @@ public sealed class CourierOptions
     public string Format { get; set; } = string.Empty;
 
     /// <summary>
-    /// Addresses the reports come from. Empty means any sender, which is what GLS has until it
-    /// starts sending to this mailbox - until then the format alone identifies its reports.
+    /// Addresses the reports come from. Empty means any sender - the format alone then identifies
+    /// the reports, which is enough to read them but not enough to trust them.
     /// </summary>
+    /// <remarks>
+    /// Matched as a substring of the sender, so an address that is written differently in the
+    /// header still lands. A message in a courier's format from anybody else is archived and
+    /// written off with the reason, not read: a payout file says who owes us money, and a file
+    /// that shape is easy enough to forge.
+    /// </remarks>
     public List<string> Senders { get; set; } = [];
 
     /// <summary>

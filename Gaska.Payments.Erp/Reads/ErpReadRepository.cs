@@ -1,6 +1,8 @@
-using Gaska.Payments.Domain.Matching;
+﻿using Gaska.Payments.Domain.Matching;
 using Gaska.Payments.Domain.Model;
 using Microsoft.Data.SqlClient;
+
+using Gaska.Payments.Erp.Reads;
 
 namespace Gaska.Payments.Erp;
 
@@ -28,7 +30,7 @@ public sealed class ErpReadRepository(string connectionString)
                     p.TrP_KntTyp, p.TrP_KntNumer
                 FROM CDN.TraPlat p
                 WHERE p.TrP_GIDTyp IN ({ReceivableDocTypes})
-                  AND p.TrP_Rozliczona <> 1 AND p.TrP_Pozostaje > 0
+                  AND p.{PaymentSettlement.OpenSql} AND p.TrP_Pozostaje > 0
             )
             SELECT
                 p.TrP_GIDTyp                                                            AS DocType,
@@ -387,7 +389,8 @@ public sealed class ErpReadRepository(string connectionString)
             FROM CDN.TraPlat AS p
             LEFT JOIN CDN.TraNag AS n
                 ON n.TrN_GIDTyp = p.TrP_GIDTyp AND n.TrN_GIDNumer = p.TrP_GIDNumer
-            LEFT JOIN CDN.KntKarty AS k ON k.Knt_GIDNumer = p.TrP_KntNumer
+            LEFT JOIN CDN.KntKarty AS k
+                ON k.Knt_GIDNumer = p.TrP_KntNumer AND k.Knt_GIDTyp = p.TrP_KntTyp
             LEFT JOIN CDN.Obiekty AS o ON o.OB_GIDTyp = p.TrP_GIDTyp
             -- Import invoices keep their header in CDN.ImpNag, not in CDN.TraNag.
             LEFT JOIN CDN.ImpNag AS imp
@@ -398,9 +401,10 @@ public sealed class ErpReadRepository(string connectionString)
             LEFT JOIN CDN.UpoNag AS upo
                 ON upo.UPN_GIDTyp = p.TrP_GIDTyp AND upo.UPN_GIDNumer = p.TrP_GIDNumer
             WHERE p.TrP_Typ = 1
-              AND p.TrP_Rozliczona <> 1
+              AND p.{PaymentSettlement.OpenSql}
               AND p.TrP_Pozostaje > 0
               AND p.TrP_KntNumer <> 0
+              AND p.{PaymentSettlement.ContractorSql}
               AND p.TrP_GIDTyp NOT IN ({SettlementDocumentTypes.NotSettleableSql})
             """;
 
@@ -466,11 +470,13 @@ public sealed class ErpReadRepository(string connectionString)
             FROM CDN.TraPlat AS p
             LEFT JOIN CDN.TraNag AS n
                 ON n.TrN_GIDTyp = p.TrP_GIDTyp AND n.TrN_GIDNumer = p.TrP_GIDNumer
-            LEFT JOIN CDN.KntKarty AS k ON k.Knt_GIDNumer = p.TrP_KntNumer
+            LEFT JOIN CDN.KntKarty AS k
+                ON k.Knt_GIDNumer = p.TrP_KntNumer AND k.Knt_GIDTyp = p.TrP_KntTyp
             LEFT JOIN CDN.Obiekty AS o ON o.OB_GIDTyp = p.TrP_GIDTyp
             WHERE LEN(LTRIM(RTRIM(ISNULL(p.TrP_EndToEndId, '')))) > 0
-              AND p.TrP_Rozliczona <> 1
+              AND p.{PaymentSettlement.OpenSql}
               AND p.TrP_Pozostaje > 0
+              AND p.{PaymentSettlement.ContractorSql}
               AND p.TrP_GIDTyp NOT IN ({SettlementDocumentTypes.NotSettleableSql})
             """;
 
@@ -511,12 +517,19 @@ public sealed class ErpReadRepository(string connectionString)
     /// <summary>Fills the index with account-to-contractor and tax-id-to-contractor links.</summary>
     public async Task LoadContractorLookupsAsync(DocumentIndex index, CancellationToken cancellationToken = default)
     {
-        const string accountsSql = """
+        // Archived accounts are left out on both sides of the union - see BankAccountSql for what
+        // reading them costs.
+        var accountsSql = $"""
+            WITH {BankAccountSql.RetiredAccounts}
             SELECT RkB_ObiNumer, RkB_NrRachunku FROM CDN.RachunkiBankowe
-            WHERE RkB_ObiTyp = 32 AND RkB_NrRachunku <> ''
+            WHERE RkB_ObiTyp = 32 AND RkB_NrRachunku <> '' AND {BankAccountSql.InUse}
             UNION
-            SELECT NRB_ObNumer, NRB_NrRachunkuZnorm FROM CDN.NumeryRachunkow
-            WHERE NRB_ObTyp = 32 AND NRB_NrRachunkuZnorm <> ''
+            SELECT n.NRB_ObNumer, n.NRB_NrRachunkuZnorm FROM CDN.NumeryRachunkow AS n
+            WHERE n.NRB_ObTyp = 32 AND n.NRB_NrRachunkuZnorm <> ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM wycofane AS w
+                  WHERE w.Knt = n.NRB_ObNumer
+                    AND w.Numer = REPLACE(RTRIM(n.NRB_NrRachunkuZnorm), ' ', ''))
             """;
 
         const string nipSql = """
@@ -532,8 +545,24 @@ public sealed class ErpReadRepository(string connectionString)
             WHERE Knt_Nazwa1 <> '' OR Knt_Akronim <> ''
             """;
 
+        // Retired cards. Not excluded from the lookups - an account is sometimes on a retired card
+        // and on no other - but a live card wins over one when both hold the same number.
+        const string archivedSql = """
+            SELECT Knt_GIDNumer FROM CDN.KntKarty WHERE Knt_GIDTyp = 32 AND Knt_Archiwalny = 1
+            """;
+
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
+
+        // The archived cards go in first: the account lookup consults them the moment it is asked.
+        await using (var command = new SqlCommand(archivedSql, connection) { CommandTimeout = 300 })
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                index.RegisterContractorArchived(reader.GetInt32(0));
+            }
+        }
 
         await using (var command = new SqlCommand(accountsSql, connection) { CommandTimeout = 300 })
         await using (var reader = await command.ExecuteReaderAsync(cancellationToken))

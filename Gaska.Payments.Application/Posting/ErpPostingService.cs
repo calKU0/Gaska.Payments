@@ -19,13 +19,14 @@ public sealed record PostingSummary(
 /// the engine considers certain.
 /// </summary>
 /// <remarks>
-/// Every XL API call runs in one stretch on one thread, with no <c>await</c> between them. The API
-/// is native and thread-bound - interleaving it with asynchronous work ended in a crash inside
-/// <c>XLLogout</c>. Results are written as we go, synchronously: were the process to break off
-/// midway, ERP would be left holding documents we know nothing about.
+/// Every XL API call runs in one stretch on the one thread that owns the session, with no
+/// <c>await</c> between them - the native library is thread-bound (see <see cref="XlSessionHost"/>).
+/// Results are written as we go, synchronously: were the process to break off midway, ERP would be
+/// left holding documents we know nothing about.
 /// </remarks>
 public sealed class ErpPostingService(
     PostingRepository repository,
+    XlSessionHost xl,
     IOptions<XlOptions> options,
     IOptions<SettlementOptions> settlementOptions,
     IOptions<CodOptions> codOptions,
@@ -127,7 +128,11 @@ public sealed class ErpPostingService(
 
         using (var posting = TimedOperation.Start(logger, "Posting to ERP through the XL API"))
         {
-            summary = PostInXl(operations, allocations, existingReports, backlog);
+            // On the XL thread, always the same one, against the session signed in when the
+            // service started - see XlSessionHost.
+            summary = await xl.RunAsync(
+                session => PostInXl(session, operations, allocations, existingReports, backlog),
+                cancellationToken);
             posting.Result(
                 $"{summary.EntriesPosted} entries, {summary.PaymentsSettled} settlements, "
                 + $"{summary.Failures} failures");
@@ -176,13 +181,13 @@ public sealed class ErpPostingService(
 
     /// <summary>All the work with the XL API - synchronous, in one session, on one thread.</summary>
     private PostingSummary PostInXl(
+        XlSession session,
         IReadOnlyList<PendingOperation> operations,
         Dictionary<long, IReadOnlyList<PendingAllocation>> allocations,
         HashSet<(string, DateTime)> existingReports,
         IReadOnlyList<PendingSettlement> backlog)
     {
         var journal = new PostingJournal(repository.ConnectionString);
-        using var session = XlSession.Open(_options, logger);
 
         var reportsCreated = 0;
         var posted = 0;
@@ -217,7 +222,8 @@ public sealed class ErpPostingService(
                 continue;
             }
 
-            if (Settle(session, journal, operation.PaymentId, entryId.Value, operation.Amount, lines)) settled++;
+            if (Settle(session, journal, operation.PaymentId, entryId.Value, operation.Amount,
+                    operation.ContractorId, lines)) settled++;
             else failures++;
         }
 
@@ -227,7 +233,8 @@ public sealed class ErpPostingService(
         {
             if (!allocations.TryGetValue(item.PaymentId, out var lines) || lines.Count == 0) continue;
 
-            if (Settle(session, journal, item.PaymentId, item.EntryId, item.Amount, lines)) settled++;
+            if (Settle(session, journal, item.PaymentId, item.EntryId, item.Amount,
+                    item.ContractorId, lines)) settled++;
             else failures++;
         }
 
@@ -243,7 +250,7 @@ public sealed class ErpPostingService(
     /// </summary>
     private bool Settle(
         XlSession session, PostingJournal journal, long paymentId, int entryId, decimal amount,
-        IReadOnlyList<PendingAllocation> lines)
+        int contractorId, IReadOnlyList<PendingAllocation> lines)
     {
         // Lines are tied back by document GID - the engine knows nothing of our identifiers.
         // Grouped rather than ToDictionary: two lines pointing at the same document payment are
@@ -268,6 +275,17 @@ public sealed class ErpPostingService(
                 journal.MarkAllocationSettled(allocationId, outcome.Gid.Numer);
             }
         }
+
+        // The entry was posted on the anonymous party whenever the payer's account was on nobody's
+        // card in ERP. By the time it settles the party is known - the account was added by hand in
+        // the meantime, or the documents named it - and the entry has to say so, or the open item
+        // sits on the contractor's invoice while the entry belongs to nobody. Does nothing when the
+        // entry already names them, which is the ordinary case.
+        if (contractorId != 0) journal.UpdateEntryContractor(paymentId, entryId, contractorId);
+
+        // The entry now names the invoices it paid instead of the bank's reference - that is what
+        // the accountants look an entry up by once it is settled.
+        journal.UpdateEntryDocumentNumber(entryId, [.. lines.Select(l => l.DocNumber)]);
 
         journal.MarkSettled(paymentId);
         return true;

@@ -1,4 +1,4 @@
-<Window x:Class="Gaska.Payments.Desktop.Views.MainWindow"
+﻿<Window x:Class="Gaska.Payments.Desktop.Views.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:mvvm="clr-namespace:Gaska.Payments.Desktop.Mvvm"
@@ -14,7 +14,6 @@
              This proxy lets a header reach the view model. -->
         <mvvm:BindingProxy x:Key="ViewModelProxy" Data="{Binding}" />
 
-        <mvvm:EmptyToCollapsedConverter x:Key="EmptyToCollapsed" />
 
         <!-- The badge colour follows from the confidence level: green only for certain
              payments, amber for the ones somebody has to look at. -->
@@ -295,56 +294,58 @@
         <!-- ============================= filters ============================ -->
         <Border Grid.Row="1" Style="{StaticResource Card}" Padding="14,12" Margin="0,0,0,14">
             <!--
-                There are seven filters and on a narrower screen they did not fit in one row - the last of
-                them (the date) were simply cut off, because a grid neither scrolls nor wraps. A WrapPanel
-                moves them to a second row instead of hiding them.
+                Sześć filtrów, które na węższym monitorze nie mieszczą się w jednym rzędzie. Każdy jest
+                osobną jednostką zawijania - wcześniej były sparowane po dwa i łamały się całymi parami,
+                przez co rząd urywał się w połowie, a wolne miejsce zostawało niewykorzystane. Przy tym
+                każdy ma mniejszą szerokość minimalną: napisy na przyciskach to teraz liczby, nie listy
+                nazw, więc nie potrzebują tyle miejsca.
             -->
             <WrapPanel Orientation="Horizontal">
-                <TextBox Width="290" Margin="0,3,18,3" VerticalContentAlignment="Center"
+                <TextBox Width="240" MinWidth="150" Margin="0,3,16,3" VerticalContentAlignment="Center"
                          Text="{Binding Search, UpdateSourceTrigger=PropertyChanged, Delay=250}"
                          ToolTip="Szuka w nazwie nadawcy, tytule przelewu, kontrahencie i kwocie." />
 
-                <StackPanel Orientation="Horizontal" Margin="0,3,18,3" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal" Margin="0,3,16,3" VerticalAlignment="Center">
                     <TextBlock Text="Kierunek" Style="{StaticResource Subtle}" VerticalAlignment="Center" Margin="0,0,8,0" />
-                    <HeaderedItemsControl Style="{StaticResource MultiSelectFilter}" MinWidth="170"
+                    <HeaderedItemsControl Style="{StaticResource MultiSelectFilter}" MinWidth="130"
                                           Header="{Binding DirectionFilterSummary}"
                                           ItemsSource="{Binding DirectionFilters}"
                                           ItemTemplate="{StaticResource FilterEntry}"
                                           ToolTip="Wpłaty rozliczają należności, wypłaty zobowiązania." />
+                </StackPanel>
 
-                    <TextBlock Text="Pewność" Style="{StaticResource Subtle}" VerticalAlignment="Center" Margin="18,0,8,0" />
-                    <HeaderedItemsControl Style="{StaticResource MultiSelectFilter}" MinWidth="200"
+                <StackPanel Orientation="Horizontal" Margin="0,3,16,3" VerticalAlignment="Center">
+                    <TextBlock Text="Pewność" Style="{StaticResource Subtle}" VerticalAlignment="Center" Margin="0,0,8,0" />
+                    <HeaderedItemsControl Style="{StaticResource MultiSelectFilter}" MinWidth="150"
                                           Header="{Binding ConfidenceFilterSummary}"
                                           ItemsSource="{Binding ConfidenceFilters}"
                                           ItemTemplate="{StaticResource ConfidenceEntry}"
                                           ToolTip="Na ile silnik jest pewien podpowiedzi. Pewne wpłaty zamyka automat." />
                 </StackPanel>
 
-                <StackPanel Orientation="Horizontal" Margin="0,3,18,3" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal" Margin="0,3,16,3" VerticalAlignment="Center">
                     <TextBlock Text="Rejestr" Style="{StaticResource Subtle}" VerticalAlignment="Center" Margin="0,0,8,0" />
-                    <HeaderedItemsControl Style="{StaticResource MultiSelectFilter}" MinWidth="190"
+                    <HeaderedItemsControl Style="{StaticResource MultiSelectFilter}" MinWidth="150"
                                           Header="{Binding RegisterFilterSummary}"
                                           ItemsSource="{Binding RegisterFilters}"
                                           ItemTemplate="{StaticResource RegisterEntry}"
                                           ToolTip="Rejestry kart kredytowych są domyślnie odznaczone – na kartach nie ma czego rozliczać, są tu tylko do podejrzenia." />
+                </StackPanel>
 
+                <StackPanel Orientation="Horizontal" Margin="0,3,16,3" VerticalAlignment="Center">
                     <TextBlock Text="Stan rozliczenia" Style="{StaticResource Subtle}"
-                               VerticalAlignment="Center" Margin="18,0,8,0" />
-                    <HeaderedItemsControl Style="{StaticResource MultiSelectFilter}" MinWidth="235"
+                               VerticalAlignment="Center" Margin="0,0,8,0" />
+                    <HeaderedItemsControl Style="{StaticResource MultiSelectFilter}" MinWidth="150"
                                           Header="{Binding SettlementFilterSummary}"
                                           ItemsSource="{Binding SettlementFilters}"
                                           ItemTemplate="{StaticResource FilterEntry}" />
                 </StackPanel>
 
-                <StackPanel Orientation="Horizontal" Margin="0,3,18,3" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal" Margin="0,3,0,3" VerticalAlignment="Center">
                     <TextBlock Text="Od dnia" Style="{StaticResource Subtle}" VerticalAlignment="Center" Margin="0,0,8,0" />
-                    <DatePicker SelectedDate="{Binding From}" MinWidth="155"
+                    <DatePicker SelectedDate="{Binding From}" MinWidth="130"
                                 ToolTip="Zakres wczytywany z bazy. Po zmianie kliknij Odśwież." />
                 </StackPanel>
-
-                <CheckBox Content="tylko z podpowiedziami" VerticalAlignment="Center" Margin="0,3"
-                          IsChecked="{Binding OnlySuggested}"
-                          ToolTip="Zostawia przelewy, dla których silnik cokolwiek zaproponował." />
             </WrapPanel>
         </Border>
 
@@ -361,7 +362,6 @@
                       CellStyle="{StaticResource Cell}"
                       ScrollViewer.HorizontalScrollBarVisibility="Auto"
                       ScrollViewer.VerticalScrollBarVisibility="Auto"
-                      FrozenColumnCount="2"
                       ItemsSource="{Binding View}" SelectedItem="{Binding Selected}">
                 <DataGrid.Columns>
                     <DataGridTemplateColumn Width="44" MinWidth="44" CanUserSort="False">
@@ -432,6 +432,22 @@
                             <Style TargetType="TextBlock" BasedOn="{StaticResource CellText}">
                                 <Setter Property="TextTrimming" Value="CharacterEllipsis" />
                                 <Setter Property="ToolTip" Value="{Binding ContractorSourceLabel}" />
+                            </Style>
+                        </DataGridTextColumn.ElementStyle>
+                    </DataGridTextColumn>
+
+                    <!--
+                        Konto zapisu na liście jest tylko do oglądania - żeby dało się jednym
+                        spojrzeniem wyłapać zapisy bez konta albo z kontem nie tym co trzeba.
+                        Edycja jest w panelu obok, gdzie widać cały kontekst przelewu.
+                    -->
+                    <DataGridTextColumn Header="Konto" Width="150" MinWidth="120"
+                                        Binding="{Binding SelectedAccount}" IsReadOnly="True">
+                        <DataGridTextColumn.ElementStyle>
+                            <Style TargetType="TextBlock" BasedOn="{StaticResource CellText}">
+                                <Setter Property="FontFamily" Value="Consolas" />
+                                <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+                                <Setter Property="ToolTip" Value="{Binding SelectedAccount}" />
                             </Style>
                         </DataGridTextColumn.ElementStyle>
                     </DataGridTextColumn>
@@ -538,10 +554,16 @@
                             <TextBox Text="{Binding Row.PayerAccount, Mode=OneWay}"
                                      Style="{StaticResource SelectableMono}" Margin="0,0,0,12" />
 
+                            <!--
+                                Kontrahent stoi w obu panelach celowo. Tutaj jest częścią opisu
+                                przelewu - czytany razem z nadawcą i jego rachunkiem, z których się
+                                wziął. W prawym panelu jest tym, co się zmienia, i tam widać, na co.
+                            -->
                             <TextBlock Text="Kontrahent w ERP" Style="{StaticResource Label}" />
                             <TextBox Text="{Binding ContractorDisplay, Mode=OneWay}"
                                      Style="{StaticResource Selectable}" />
-                            <TextBlock Text="{Binding ContractorSourceLabel}" Style="{StaticResource Subtle}" Margin="0,0,0,12" />
+                            <TextBlock Text="{Binding ContractorSourceLabel}" Style="{StaticResource Subtle}"
+                                       Margin="0,0,0,12" />
 
                             <TextBlock Text="Dlaczego taka klasyfikacja" Style="{StaticResource Label}" />
                             <TextBox Text="{Binding Notes, Mode=OneWay}" Style="{StaticResource Selectable}"
@@ -564,27 +586,52 @@
                             <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
 
-                        <Grid Grid.Row="0" Margin="0,0,0,10">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-
+                        <!--
+                            Tytuł, legenda i filtry w jednym zawijanym pasku. Wcześniej filtry
+                            siedziały w kolumnie o stałej szerokości po prawej i na węższym panelu
+                            były po prostu ucinane - "wybrano 2 z 3" kończyło się na krawędzi karty.
+                        -->
+                        <WrapPanel Grid.Row="0" Margin="0,0,0,8">
                             <TextBlock Text="Nierozliczone dokumenty kontrahenta" Style="{StaticResource H2}"
-                                       VerticalAlignment="Center" Margin="0" />
+                                       VerticalAlignment="Center" Margin="0,0,18,6" />
 
-                            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                            <!--
+                                Legenda i każdy filtr osobno, a nie w jednym panelu: WrapPanel
+                                zawija dzieci, ale pojedynczemu dziecku szerszemu od wiersza i tak
+                                daje jego szerokość, więc zbite w jedno dalej byłyby ucinane.
+                            -->
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,18,6">
                                 <Border Width="12" Height="12" CornerRadius="3" Background="#F2FBF5"
                                         BorderBrush="#BFE3CC" BorderThickness="1" VerticalAlignment="Center" />
                                 <TextBlock Text="należność" Style="{StaticResource Subtle}"
-                                           VerticalAlignment="Center" Margin="6,0,16,0" />
+                                           VerticalAlignment="Center" Margin="6,0,14,0" />
 
                                 <Border Width="12" Height="12" CornerRadius="3" Background="#FEF4F4"
                                         BorderBrush="#F0C9C9" BorderThickness="1" VerticalAlignment="Center" />
                                 <TextBlock Text="zobowiązanie" Style="{StaticResource Subtle}"
                                            VerticalAlignment="Center" Margin="6,0,0,0" />
                             </StackPanel>
-                        </Grid>
+
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,14,6">
+                                <TextBlock Text="Strona" Style="{StaticResource Subtle}"
+                                           VerticalAlignment="Center" Margin="0,0,8,0" />
+                                <HeaderedItemsControl Style="{StaticResource MultiSelectFilter}" MinWidth="130"
+                                                      Header="{Binding DocumentSideFilterSummary}"
+                                                      ItemsSource="{Binding DocumentSideFilters}"
+                                                      ItemTemplate="{StaticResource FilterEntry}"
+                                                      ToolTip="Należności i zobowiązania kontrahenta. Zaznaczone dokumenty widać zawsze." />
+                            </StackPanel>
+
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,0,6">
+                                <TextBlock Text="Stan rozliczenia" Style="{StaticResource Subtle}"
+                                           VerticalAlignment="Center" Margin="0,0,8,0" />
+                                <HeaderedItemsControl Style="{StaticResource MultiSelectFilter}" MinWidth="150"
+                                                      Header="{Binding DocumentStateFilterSummary}"
+                                                      ItemsSource="{Binding DocumentStateFilters}"
+                                                      ItemTemplate="{StaticResource FilterEntry}"
+                                                      ToolTip="Ten sam filtr co nad kolejką. Płatności z zaznaczonym w ERP „nie rozliczaj” są domyślnie ukryte." />
+                            </StackPanel>
+                        </WrapPanel>
 
                         <DataGrid Grid.Row="1" Style="{StaticResource Table}"
                                   ColumnHeaderStyle="{StaticResource ColumnHeader}"
@@ -592,8 +639,7 @@
                                   RowStyle="{StaticResource DocumentRow}"
                                   ScrollViewer.HorizontalScrollBarVisibility="Auto"
                                   ScrollViewer.VerticalScrollBarVisibility="Auto"
-                                  FrozenColumnCount="2"
-                                  ItemsSource="{Binding Selected.Documents}" RowHeight="32">
+                                  ItemsSource="{Binding DocumentsView}" RowHeight="32">
                             <DataGrid.Columns>
                                 <DataGridTemplateColumn Width="44" MinWidth="44" CanUserSort="False">
                                     <DataGridTemplateColumn.CellTemplate>
@@ -606,6 +652,22 @@
 
                                 <DataGridTextColumn Header="Dokument" Width="190" MinWidth="134" Binding="{Binding DocNumber}"
                                                     ElementStyle="{StaticResource CellText}" />
+
+                                <!--
+                                    Znacznik „nie rozliczaj” z ERP (TrP_Rozliczona = 2). Zapisuje
+                                    się od razu po kliknięciu - to jedno pole na jednej płatności,
+                                    a księgowość ustawia je czytając listę.
+                                -->
+                                <DataGridTemplateColumn Header="Nie rozliczaj" Width="104" MinWidth="96"
+                                                        SortMemberPath="DoNotSettle" CanUserSort="True">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <CheckBox IsChecked="{Binding DoNotSettle, UpdateSourceTrigger=PropertyChanged}"
+                                                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                      ToolTip="Ustawia w ERP „nie rozliczaj” na tej płatności. Zaznaczenie zdejmuje dokument z rozliczanych." />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
                                 <DataGridTextColumn Header="Typ" Width="66" MinWidth="60" Binding="{Binding Symbol}"
                                                     ElementStyle="{StaticResource CellText}" />
                                 <DataGridTextColumn Header="Strona" Width="108" MinWidth="96" Binding="{Binding Kind}"
@@ -645,31 +707,55 @@
                         <!-- summary: whether it balances has to be visible at a glance -->
                         <Border Grid.Row="2" Margin="0,12,0,0" CornerRadius="6" Padding="14,10"
                                 Background="{StaticResource Canvas}" DataContext="{Binding Selected}">
-                            <StackPanel Orientation="Horizontal">
-                                <StackPanel Margin="0,0,30,0">
+                            <!--
+                                Nadpłata trzyma swoje miejsce z prawej, a sumy przelewu zawijają się
+                                w lewej części. Wcześniej wszystko było dokowane w jednym rzędzie:
+                                na węższym monitorze nie było gdzie tego upchnąć i nadpłata wchodziła
+                                na "Do rozliczenia". DockPanel nie zawija, więc zawijaniem zajmuje się
+                                WrapPanel, który dostaje resztę szerokości.
+                            -->
+                            <DockPanel>
+                                <StackPanel DockPanel.Dock="Right" HorizontalAlignment="Right"
+                                            Margin="24,0,0,0" MaxWidth="260"
+                                            Visibility="{Binding HasOverpayment,
+                                                         Converter={StaticResource BoolToVisibility}}">
+                                    <TextBlock Text="Nadpłata kontrahenta" Style="{StaticResource Label}"
+                                               ToolTip="Wpłaty tego kontrahenta stojące w ERP nierozliczone z żadnym dokumentem. Bez tego przelewu." />
+                                    <TextBlock Style="{StaticResource Money}" HorizontalAlignment="Right"
+                                               FontWeight="SemiBold"
+                                               Foreground="{StaticResource Warn}"
+                                               ToolTip="{Binding OverpaymentDetail}"
+                                               Text="{Binding OverpaymentAmount, StringFormat={}{0:N2}}" />
+                                    <TextBlock Text="{Binding OverpaymentDetail}" Style="{StaticResource Subtle}"
+                                               HorizontalAlignment="Right" FontSize="11"
+                                               TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+
+                                <WrapPanel Orientation="Horizontal">
+                                <StackPanel Margin="0,0,28,6">
                                     <TextBlock Text="Kwota przelewu" Style="{StaticResource Label}" />
                                     <TextBlock Text="{Binding Amount, StringFormat={}{0:N2}}"
                                                Style="{StaticResource Money}" HorizontalAlignment="Left" />
                                 </StackPanel>
-                                <StackPanel Margin="0,0,30,0">
+                                <StackPanel Margin="0,0,28,6">
                                     <TextBlock Text="Pozostało" Style="{StaticResource Label}"
                                                ToolTip="Ile z przelewu nie jest jeszcze rozliczone w ERP." />
                                     <TextBlock Text="{Binding Remaining, StringFormat={}{0:N2}}"
                                                Style="{StaticResource Money}" HorizontalAlignment="Left" />
                                 </StackPanel>
-                                <StackPanel Margin="0,0,30,0">
+                                <StackPanel Margin="0,0,28,6">
                                     <TextBlock Text="Należności" Style="{StaticResource Label}"
                                                ToolTip="Suma zaznaczonych dokumentów po stronie należności." />
                                     <TextBlock Text="{Binding SelectedInvoices, StringFormat={}{0:N2}}"
                                                Style="{StaticResource Money}" HorizontalAlignment="Left" />
                                 </StackPanel>
-                                <StackPanel Margin="0,0,30,0">
+                                <StackPanel Margin="0,0,28,6">
                                     <TextBlock Text="Zobowiązania" Style="{StaticResource Label}"
                                                ToolTip="Suma zaznaczonych dokumentów po stronie zobowiązań." />
                                     <TextBlock Text="{Binding SelectedLiabilities, StringFormat={}−{0:N2}}"
                                                Style="{StaticResource Money}" HorizontalAlignment="Left" />
                                 </StackPanel>
-                                <StackPanel Margin="0,0,30,0">
+                                <StackPanel Margin="0,0,28,6">
                                     <TextBlock Text="Zostanie rozliczone" Style="{StaticResource Label}" />
                                     <TextBlock Text="{Binding SelectedNet, StringFormat={}{0:N2}}"
                                                Style="{StaticResource Money}" HorizontalAlignment="Left"
@@ -686,7 +772,8 @@
                                         </TextBlock.Foreground>
                                     </TextBlock>
                                 </StackPanel>
-                            </StackPanel>
+                                </WrapPanel>
+                            </DockPanel>
                         </Border>
                     </Grid>
                 </Border>
@@ -697,65 +784,88 @@
                 <Border Grid.Column="4" Style="{StaticResource Card}" Padding="16,14,6,14">
                     <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,12,0">
                         <StackPanel>
-                            <TextBlock Text="Zły kontrahent?" Style="{StaticResource H2}" />
-                            <TextBlock Style="{StaticResource Subtle}" TextWrapping="Wrap" Margin="0,0,0,10"
-                                       Text="Wyszukaj właściwego – lista dokumentów przeładuje się na jego rozrachunki." />
+                            <TextBlock Text="Kontrahent" Style="{StaticResource H2}" />
 
-                            <Grid Margin="0,0,0,10">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBox VerticalContentAlignment="Center"
-                                         Text="{Binding ContractorQuery, UpdateSourceTrigger=PropertyChanged}"
-                                         ToolTip="Akronim, nazwa albo NIP." />
-                                <Button Grid.Column="1" Content="Szukaj" Margin="8,0,0,0"
-                                        Style="{StaticResource Small}" Command="{Binding FindContractorCommand}" />
-                            </Grid>
-
-                            <ListBox x:Name="ContractorHits" ItemsSource="{Binding ContractorHits}"
-                                     MaxHeight="170" Margin="0,0,0,10"
-                                     BorderBrush="{StaticResource Line}">
-                                <ListBox.ItemTemplate>
+                            <!--
+                                Kto stoi na przelewie i na kogo można go zmienić - jedna kontrolka
+                                zamiast pola z nazwą, pola szukania i listy trafień pod spodem.
+                                Wyszukiwarka siedzi w rozwiniętej liście, więc panel nie płaci za
+                                nią osobnym wierszem. Zaznaczenie pozycji przeładowuje konta niżej,
+                                ale do ERP nic nie idzie, dopóki nie zostanie kliknięty przycisk.
+                            -->
+                            <ComboBox Style="{StaticResource SearchablePicker}" Margin="0,2,0,2"
+                                      ItemsSource="{Binding ContractorOptions}"
+                                      SelectedItem="{Binding ContractorPick, Mode=TwoWay}"
+                                      mvvm:PickerSearch.Text="{Binding ContractorQuery, Mode=TwoWay}"
+                                      Tag="{Binding ContractorHitsSummary}"
+                                      ToolTip="Kontrahent, na którego zaksięgowany jest zapis kasowy. Rozwiń, żeby wyszukać innego.">
+                                <ComboBox.ItemTemplate>
                                     <DataTemplate>
-                                        <StackPanel Margin="0,3">
-                                            <TextBlock Text="{Binding Acronym}" FontWeight="SemiBold" FontSize="12" />
+                                        <StackPanel Margin="0,1">
+                                            <TextBlock Text="{Binding Acronym}" FontWeight="SemiBold" FontSize="12.5" />
                                             <TextBlock Text="{Binding Name}" Style="{StaticResource Subtle}"
-                                                       TextTrimming="CharacterEllipsis" />
+                                                       FontSize="11" TextTrimming="CharacterEllipsis"
+                                                       Visibility="{Binding Name, Converter={StaticResource EmptyToCollapsed}}" />
                                         </StackPanel>
                                     </DataTemplate>
-                                </ListBox.ItemTemplate>
-                            </ListBox>
+                                </ComboBox.ItemTemplate>
+                            </ComboBox>
 
-                            <Button Content="Pokaż jego dokumenty" Margin="0,0,0,20"
+                            <TextBlock Text="{Binding Selected.ContractorSourceLabel}"
+                                       Style="{StaticResource Subtle}" Margin="0,0,0,14" />
+
+                            <!--
+                                Konto przeciwstawne, na które przelew zostanie rozliczony. Stoi
+                                między kontrahentem a przyciskiem, bo to druga połowa tej samej
+                                decyzji: zaznaczenie kontrahenta na liście przeładowuje tę listę na
+                                jego konta, konto można tu poprawić, a przycisk pod spodem zapisuje
+                                jedno i drugie. Sam wybór z listy nic nie zapisuje - konto trafia na
+                                zapis razem z podmiotem: przy zmianie kontrahenta albo przy
+                                rozliczeniu. Osobny przycisk "zapisz" pozwalał kiedyś zapisać konto
+                                pod rozliczenie, którego nigdy nie było.
+                            -->
+                            <TextBlock Text="Konto" Style="{StaticResource H2}" />
+
+                            <ComboBox Style="{StaticResource SearchablePicker}" Margin="0,2,0,0"
+                                      ItemsSource="{Binding AccountOptions}"
+                                      SelectedValuePath="Account"
+                                      SelectedValue="{Binding Selected.SelectedAccount}"
+                                      IsEnabled="{Binding Selected.CanChooseAccount}"
+                                      mvvm:PickerSearch.Text="{Binding AccountFilter, Mode=TwoWay}"
+                                      Tag="{Binding AccountsFound}"
+                                      ToolTip="Konto przeciwstawne zapisu (KAZ_KontoPrzec). Trafia na zapis przy zmianie kontrahenta albo przy rozliczeniu przelewu. Rozwiń, żeby wyszukać po numerze lub nazwie.">
+                                <ComboBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <StackPanel Margin="0,1">
+                                            <TextBlock Text="{Binding Account}" FontFamily="Consolas">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock">
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding Contractors}" Value="True">
+                                                                <Setter Property="FontWeight" Value="SemiBold" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                            <TextBlock Text="{Binding Name}" Style="{StaticResource Subtle}"
+                                                       FontSize="11" TextTrimming="CharacterEllipsis"
+                                                       Visibility="{Binding Name, Converter={StaticResource EmptyToCollapsed}}" />
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ComboBox.ItemTemplate>
+                            </ComboBox>
+
+
+                            <Button Content="Zmień kontrahenta" Margin="0,0,0,20"
                                     Style="{StaticResource Wide}"
                                     Command="{Binding UseContractorCommand}"
-                                    CommandParameter="{Binding SelectedItem, ElementName=ContractorHits}" />
-
-                            <Button Content="Wróć do podpowiedzi serwisu" Margin="0,0,0,10"
-                                    Style="{StaticResource Wide}"
-                                    Command="{Binding RestoreContractorCommand}"
-                                    Visibility="{Binding Selected.ContractorOverridden,
-                                                         Converter={StaticResource BoolToVisibility}}"
-                                    ToolTip="Cofa ręczną podmianę kontrahenta i wraca do tego, co wyliczył serwis." />
+                                    ToolTip="Pokazuje rozrachunki kontrahenta wybranego wyżej i przepisuje na niego zapis kasowy w ERP – podmiot i konto przeciwstawne. Nieaktywne, dopóki wybrany jest ten sam kontrahent, który już jest na przelewie." />
 
                             <Button Content="Przypisz rachunek do kontrahenta" Margin="0,0,0,20"
                                     Style="{StaticResource Wide}"
                                     Command="{Binding AssignAccountCommand}"
                                     ToolTip="Dopisuje rachunek bankowy z tego przelewu do kartoteki wybranego kontrahenta. Kolejny przelew z tego konta serwis rozpozna sam. Nieaktywne, gdy rachunek już jest przypisany." />
-
-                            <TextBlock Text="Dołącz dokument po numerze" Style="{StaticResource H2}" />
-                            <Grid Margin="0,0,0,20">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBox VerticalContentAlignment="Center"
-                                         Text="{Binding DocumentQuery, UpdateSourceTrigger=PropertyChanged}"
-                                         ToolTip="Sam numer, na przykład 33575." />
-                                <Button Grid.Column="1" Content="Dołącz" Margin="8,0,0,0"
-                                        Style="{StaticResource Small}" Command="{Binding FindDocumentCommand}" />
-                            </Grid>
 
                             <Border Height="1" Background="{StaticResource Line}" Margin="0,0,0,18" />
 
@@ -764,15 +874,16 @@
                                     Command="{Binding SettleCurrentCommand}" />
 
                             <!--
-                                Shown only on an untouched entry: the "not subject to settlement" flag contradicts somebody
-                                having already matched part of the amount to something.
+                                Jeden przycisk w obie strony: napis mówi, co się stanie. Widoczny tylko
+                                na zapisie nietkniętym albo już oznaczonym - znacznik "nie podlega
+                                rozliczeniu" przeczy temu, że ktoś dopasował już część kwoty.
                             -->
-                            <Button Content="Oznacz: nie rozliczaj" Margin="0,0,0,10"
+                            <Button Content="{Binding DoNotSettleLabel}" Margin="0,0,0,10"
                                     Style="{StaticResource Wide}"
                                     Command="{Binding DoNotSettleCommand}"
                                     Visibility="{Binding Selected.CanMarkDoNotSettle,
                                                          Converter={StaticResource BoolToVisibility}}"
-                                    ToolTip="Ustawia w ERP znacznik „nie podlega rozliczeniu” – dla prowizji, zwrotów i przeksięgowań." />
+                                    ToolTip="{Binding DoNotSettleHint}" />
 
                             <Button Content="Cofnij rozliczenie" Margin="0,0,0,10"
                                     Style="{StaticResource Wide}" Command="{Binding RevokeCommand}"

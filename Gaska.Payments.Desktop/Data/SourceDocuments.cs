@@ -1,4 +1,5 @@
-using System.IO;
+﻿using System.IO;
+using Microsoft.Extensions.Logging;
 
 namespace Gaska.Payments.Desktop.Data;
 
@@ -21,7 +22,7 @@ namespace Gaska.Payments.Desktop.Data;
 /// otherwise have to reference the whole infrastructure project - a mail client, a SOAP stack and
 /// a spreadsheet reader - to learn how to build two paths.
 /// </remarks>
-public sealed class SourceDocuments(string archiveDirectory)
+public sealed class SourceDocuments(string archiveDirectory, ILogger? logger = null)
 {
     private const string Statements = "Wyciągi";
 
@@ -31,6 +32,23 @@ public sealed class SourceDocuments(string archiveDirectory)
     private readonly string _root = archiveDirectory.Trim();
 
     public bool IsConfigured => _root.Length > 0;
+
+    /// <summary>Whether the archive root is actually there - a setting alone proves nothing.</summary>
+    public bool Exists => IsConfigured && Directory.Exists(Path.Combine(_root, Statements));
+
+    /// <summary>
+    /// The archive as it is for the startup log: where it is looked for and whether it answers.
+    /// </summary>
+    /// <remarks>
+    /// Worth a line of its own because the archive is the one setting the application cannot
+    /// complain about by itself. A wrong root looks exactly like a day with no statement - the
+    /// button is simply not there - and the service writes to a folder of its own, so the two can
+    /// drift apart without anything noticing. That is what happened: the service was filing to a
+    /// share while the application looked in a local folder that did not exist.
+    /// </remarks>
+    public string Describe() => !IsConfigured
+        ? "archiwum nieskonfigurowane (Archive:Directory)"
+        : $"archiwum {_root} ({(Exists ? "dostępne" : "NIEDOSTĘPNE albo bez podfolderu " + Statements)})";
 
     /// <summary>
     /// The file behind the entry, or null when the archive holds none.
@@ -57,30 +75,60 @@ public sealed class SourceDocuments(string archiveDirectory)
     /// </summary>
     /// <remarks>
     /// Looked up by prefix rather than assembled, because the second half of the name is the
-    /// account number and the application has no reason to know it. The answer is kept, including
-    /// the answer "there is no such folder", so that clicking through the queue does not go to
-    /// disk on every row.
+    /// account number and the application has no reason to know it.
+    ///
+    /// A folder that was found is remembered, so that clicking through the queue does not go to
+    /// disk on every row. A folder that was not found is looked for again: the service creates one
+    /// the first time it saves a statement for that register, and a "no" cached at start-up would
+    /// otherwise hide every statement of that register until the application was restarted.
     /// </remarks>
     private string? StatementFolder(string series)
     {
-        if (_folders.TryGetValue(series, out var found)) return found;
+        if (_folders.TryGetValue(series, out var found) && found is not null) return found;
 
         var statements = Path.Combine(_root, Statements);
 
         try
         {
-            found = Directory.Exists(statements)
-                ? Directory.EnumerateDirectories(statements, $"{series} - *").FirstOrDefault()
-                : null;
+            if (!Directory.Exists(statements))
+            {
+                Warn("Nie ma folderu {Folder} - przyciski z wyciągami się nie pokażą.", statements);
+                found = null;
+            }
+            else
+            {
+                found = Directory.EnumerateDirectories(statements, $"{series} - *").FirstOrDefault();
+
+                if (found is null)
+                {
+                    Warn("W {Folder} nie ma folderu rejestru {Series} - jego wyciągów nie pokażę.",
+                        statements, series);
+                }
+            }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             // An archive on a share that is not answering. Nothing to open, and nothing worth
-            // stopping the queue for.
+            // stopping the queue for - but it must not pass in silence either, because from the
+            // window it is indistinguishable from a day the bank had no statement for.
+            Warn("Nie mogę odczytać {Folder}: {Blad}", statements, exception.Message);
             found = null;
         }
 
         _folders[series] = found;
         return found;
+    }
+
+    /// <summary>Said once per reason, so clicking through the queue does not fill the log.</summary>
+    private readonly HashSet<string> _said = [];
+
+    private void Warn(string message, params object?[] arguments)
+    {
+        if (logger is null) return;
+
+        var key = message + string.Join('|', arguments);
+        if (!_said.Add(key)) return;
+
+        logger.LogWarning(message, arguments);
     }
 }

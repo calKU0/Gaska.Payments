@@ -8,7 +8,14 @@
         ResizeMode="NoResize"
         Background="{StaticResource Canvas}">
 
+    <!--
+        Zawartość w ScrollViewerze, a wysokość okna ograniczona do ekranu (BankWindow.xaml.cs).
+        Księgowość pracuje na mniejszych monitorach, a przy skalowaniu Windows 125-150% formularz
+        w naturalnej wysokości nie mieści się na 1366x768 - bez tego przyciski na dole zostawały
+        pod krawędzią ekranu, a okna nie da się ani zmniejszyć, ani przewinąć.
+    -->
     <Border Style="{StaticResource Card}" Margin="16" Padding="22">
+        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,4,0">
         <StackPanel>
             <TextBlock x:Name="TitleText" Style="{StaticResource H1}" />
             <TextBlock x:Name="IntroText" Style="{StaticResource Subtle}" TextWrapping="Wrap"
@@ -16,10 +23,27 @@
 
             <Border Background="{StaticResource Canvas}" BorderBrush="{StaticResource Line}"
                     BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,16,0,0">
-                <StackPanel>
-                    <TextBlock Text="Numer rachunku" Style="{StaticResource Label}" Margin="0,0,0,5" />
-                    <TextBox x:Name="AccountBox" Style="{StaticResource SelectableMono}" FontSize="14.5" />
-                </StackPanel>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel>
+                        <TextBlock Text="Numer rachunku" Style="{StaticResource Label}" Margin="0,0,0,5" />
+                        <TextBox x:Name="AccountBox" Style="{StaticResource SelectableMono}" FontSize="14.5" />
+                    </StackPanel>
+
+                    <!--
+                        Dane banku z publicznego rejestru IBAN. Otwiera stronę obok formularza i
+                        przepisuje z niej, co poda; okno zostaje otwarte, żeby operator mógł
+                        porównać. Zamyka się razem z tym formularzem.
+                    -->
+                    <Button x:Name="LookupButton" Grid.Column="1" Content="Pobierz dane z sieci"
+                            Style="{StaticResource Btn}" MinWidth="0" Padding="14,6" Margin="12,0,0,0"
+                            VerticalAlignment="Bottom" Click="OnLookUp"
+                            ToolTip="Sprawdza numer na pl.ibancalculator.com i wypełnia pola poniżej." />
+                </Grid>
             </Border>
 
             <Grid Margin="0,16,0,0">
@@ -53,6 +77,9 @@
             <TextBlock Text="Nazwa banku" Style="{StaticResource Label}" Margin="0,14,0,2" />
             <TextBox x:Name="NameBox" MaxLength="100" VerticalContentAlignment="Center" />
 
+            <TextBlock Text="Ulica (opcjonalnie)" Style="{StaticResource Label}" Margin="0,14,0,2" />
+            <TextBox x:Name="StreetBox" MaxLength="60" VerticalContentAlignment="Center" />
+
             <Grid Margin="0,14,0,0">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
@@ -84,5 +111,6 @@
                         Click="OnConfirm" IsDefault="True" />
             </StackPanel>
         </StackPanel>
+        </ScrollViewer>
     </Border>
 </Window>

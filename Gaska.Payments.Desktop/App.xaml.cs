@@ -1,4 +1,5 @@
-using System.Globalization;
+﻿using System.Globalization;
+using System.Linq;
 using System.IO;
 using System.Windows.Markup;
 using System.Windows;
@@ -64,7 +65,8 @@ public partial class App : System.Windows.Application
 
         // The archive of statements and courier reports, shared with the service - the button on
         // an entry opens whatever the service filed there.
-        var documents = new SourceDocuments(configuration.GetSection("Archive")["Directory"] ?? string.Empty);
+        var documents = new SourceDocuments(
+            configuration.GetSection("Archive")["Directory"] ?? string.Empty, logger);
 
         if (registers.All.Count == 0)
         {
@@ -120,13 +122,63 @@ public partial class App : System.Windows.Application
             "registers {Registers}.",
             typeof(App).Assembly.GetName().Version?.ToString() ?? "unknown",
             DescribeConnection(connectionString),
-            documents.IsConfigured ? "configured" : "not configured",
+            documents.Describe(),
             string.Join(", ", registers.All));
 
         MainWindow = new MainWindow { DataContext = viewModel };
+        SizeFromCommandLine(MainWindow, e.Args, logger);
         MainWindow.Show();
 
         _ = viewModel.StartAsync();
+    }
+
+    /// <summary>
+    /// Opens the window at a size given on the command line, instead of maximised.
+    /// </summary>
+    /// <remarks>
+    /// For checking how the window behaves on the screens the accounting team actually works on
+    /// without going to their desks:
+    ///
+    /// <code>RozliczaniePrzelewow.exe --rozmiar 1280x1024</code>
+    ///
+    /// Larger than the work area is clamped to it - a window bigger than the screen would hide the
+    /// very edges the check is about. Anything unparseable is logged and ignored rather than
+    /// refused: the size is a convenience, not a reason not to start.
+    /// </remarks>
+    private static void SizeFromCommandLine(Window window, string[] args, ILogger logger)
+    {
+        var wanted = args
+            .SkipWhile(a => !a.Equals("--rozmiar", StringComparison.OrdinalIgnoreCase)
+                            && !a.Equals("--size", StringComparison.OrdinalIgnoreCase))
+            .Skip(1)
+            .FirstOrDefault();
+
+        if (wanted is null) return;
+
+        var parts = wanted.Split(['x', 'X', '*'], StringSplitOptions.RemoveEmptyEntries);
+
+        if (parts.Length != 2
+            || !int.TryParse(parts[0], out var width)
+            || !int.TryParse(parts[1], out var height)
+            || width < 640 || height < 480)
+        {
+            logger.LogWarning(
+                "Nie rozumiem rozmiaru okna \"{Size}\". Oczekiwany zapis to --rozmiar 1280x1024.", wanted);
+            return;
+        }
+
+        window.WindowState = WindowState.Normal;
+        window.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+
+        // MinWidth/MinHeight on the window would otherwise win over a smaller size asked for here,
+        // and the point of asking is to see what a smaller screen does.
+        window.MinWidth = Math.Min(window.MinWidth, width);
+        window.MinHeight = Math.Min(window.MinHeight, height);
+
+        window.Width = Math.Min(width, SystemParameters.WorkArea.Width);
+        window.Height = Math.Min(height, SystemParameters.WorkArea.Height);
+
+        logger.LogInformation("Okno otwarte w rozmiarze {Width}x{Height}.", window.Width, window.Height);
     }
 
     /// <summary>

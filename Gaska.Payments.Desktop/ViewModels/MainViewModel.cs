@@ -1,10 +1,11 @@
-using System.Collections.ObjectModel;
+﻿using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Linq;
 using System.Windows.Data;
 using System.Windows.Threading;
 using System.Windows;
 using Gaska.Payments.Desktop.Data;
+using Gaska.Payments.Erp.Posting;
 using Gaska.Payments.Desktop.Mvvm;
 using Gaska.Payments.Domain.Diagnostics;
 using Gaska.Payments.Erp;
@@ -40,9 +41,14 @@ public sealed class MainViewModel : ObservableObject
     private bool _isBusy;
     private string _status = string.Empty;
     private string _contractorQuery = string.Empty;
-    private string _documentQuery = string.Empty;
-    private bool _onlySuggested;
+
+    /// <summary>Cancels the contractor search still in flight when another key is pressed.</summary>
+    private CancellationTokenSource? _contractorSearch;
     private OperatorAccess? _operator;
+    private string _accountFilter = string.Empty;
+
+    /// <summary>The whole chart of accounts, read once when the queue is loaded.</summary>
+    private IReadOnlyList<AccountRow> _chart = [];
 
     public MainViewModel(
         QueueRepository repository, DecisionStore store, XlWorker worker, RegisterSettings registers,
@@ -91,26 +97,26 @@ public sealed class MainViewModel : ObservableObject
             RegisterFilters.Add(option);
         }
 
+        foreach (var side in DocumentSideFilters) WatchDocuments(side, nameof(DocumentSideFilterSummary));
+        foreach (var state in DocumentStateFilters) WatchDocuments(state, nameof(DocumentStateFilterSummary));
+
         RefreshCommand = new RelayCommand(async _ => await LoadAsync(), _ => !IsBusy);
         SettleCheckedCommand = new RelayCommand(async _ => await SettleAsync(Checked), _ => !IsBusy && Checked.Count > 0);
         SettleCurrentCommand = new RelayCommand(
             async _ => await SettleAsync(Selected is null ? [] : [Selected]),
-            _ => !IsBusy && Selected is { } p && p.Selected.Count > 0);
+            _ => !IsBusy && Selected is { IsDoNotSettle: false } p && p.Selected.Count > 0);
         RevokeCommand = new RelayCommand(
             async _ => await RevokeAsync(),
             _ => !IsBusy && Selected is { HasSettlements: true });
-        FindContractorCommand = new RelayCommand(async _ => await FindContractorsAsync(), _ => !IsBusy);
-        FindDocumentCommand = new RelayCommand(async _ => await FindDocumentsAsync(), _ => !IsBusy);
-        UseContractorCommand = new RelayCommand(async o => await UseContractorAsync(o as ContractorRow), _ => !IsBusy);
+        UseContractorCommand = new RelayCommand(
+            async o => await UseContractorAsync(o as ContractorRow ?? ContractorPick),
+            _ => !IsBusy && Selected is { } p && ContractorPick is { } pick && pick.Id != p.EffectiveContractorId);
         DoNotSettleCommand = new RelayCommand(
             async _ => await MarkDoNotSettleAsync(),
-            _ => !IsBusy && DoNotSettleTargets().Count > 0);
+            _ => !IsBusy && DoNotSettleTargets().Any(i => i.IsDoNotSettle != DoNotSettleSets()));
         AssignAccountCommand = new RelayCommand(
             async _ => await AssignAccountAsync(),
             _ => !IsBusy && Selected is { CanAssignAccount: true });
-        RestoreContractorCommand = new RelayCommand(
-            async _ => await RestoreContractorAsync(),
-            _ => !IsBusy && Selected is { ContractorOverridden: true });
         OpenSourceDocumentCommand = new RelayCommand(
             _ => OpenSourceDocument(),
             _ => Selected is { HasSourceDocument: true });
@@ -123,6 +129,114 @@ public sealed class MainViewModel : ObservableObject
     public ICollectionView View { get; }
 
     public ObservableCollection<ContractorRow> ContractorHits { get; } = [];
+
+    /// <summary>
+    /// The accounts offered by the picker: this contractor's first, then the rest of the plan.
+    /// </summary>
+    /// <remarks>
+    /// One list for the window rather than one per row - the plan runs to 41 537 accounts, and a
+    /// copy on every transfer in the queue would be absurd.
+    ///
+    /// Replaced wholesale on every rebuild rather than emptied and refilled. Emptying a live
+    /// <c>ItemsSource</c> takes the drop-down's selection with it, and pushing the same account
+    /// back afterwards changes nothing - a dependency property ignores an assignment equal to what
+    /// it already holds, so the control kept an unresolved value and painted an empty box over a
+    /// column that read correctly. A new list makes the control resolve the selection again.
+    /// </remarks>
+    public IReadOnlyList<AccountOption> AccountOptions
+    {
+        get => _accountOptions;
+        private set => Set(ref _accountOptions, value);
+    }
+
+    private IReadOnlyList<AccountOption> _accountOptions = [];
+
+    /// <summary>
+    /// What the operator has typed into the picker. Narrows the list to accounts whose number or
+    /// name contains it.
+    /// </summary>
+    public string AccountFilter
+    {
+        get => _accountFilter;
+        set { if (Set(ref _accountFilter, value)) RebuildAccountOptions(); }
+    }
+
+    /// <summary>How many accounts the list shows at once.</summary>
+    /// <remarks>
+    /// The plan is far too long to hand to a drop-down whole. The contractor's own accounts always
+    /// fit inside this, and the rest is what the operator narrows by typing - which is why the
+    /// filter searches the name as well as the number.
+    /// </remarks>
+    private const int AccountsShown = 200;
+
+    /// <summary>
+    /// Rebuilds the picker's list for the selected transfer.
+    /// </summary>
+    /// <remarks>
+    /// The contractor's accounts come first, commonest first, because one of them is nearly always
+    /// the answer. Everything else follows in account order, so a new account can still be chosen
+    /// without leaving the application for ERP.
+    /// </remarks>
+    private void RebuildAccountOptions()
+    {
+        var mine = Selected?.ContractorAccounts ?? [];
+        var filter = _accountFilter.Trim();
+
+        bool Matches(string account, string name) =>
+            filter.Length == 0
+            || account.Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || name.Contains(filter, StringComparison.OrdinalIgnoreCase);
+
+        var names = _chart.ToDictionary(a => a.Account, a => a.Name, StringComparer.OrdinalIgnoreCase);
+
+        var chosen = new List<AccountOption>();
+        var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Whatever is on the entry heads the list whatever the filter says. Without it the
+        // drop-down has nothing to resolve its own value against and comes up empty - which is
+        // exactly what happened to accounts sitting past the 200 shown.
+        if (Selected?.SelectedAccount is { Length: > 0 } current)
+        {
+            chosen.Add(new AccountOption(current, names.GetValueOrDefault(current, string.Empty),
+                Contractors: mine.Contains(current, StringComparer.OrdinalIgnoreCase)));
+            taken.Add(current);
+        }
+
+        foreach (var account in mine)
+        {
+            if (taken.Contains(account)) continue;
+
+            var name = names.GetValueOrDefault(account, string.Empty);
+            if (!Matches(account, name)) continue;
+
+            chosen.Add(new AccountOption(account, name, Contractors: true));
+            taken.Add(account);
+        }
+
+        foreach (var row in _chart)
+        {
+            if (chosen.Count >= AccountsShown) break;
+            if (taken.Contains(row.Account) || !Matches(row.Account, row.Name)) continue;
+
+            chosen.Add(new AccountOption(row.Account, row.Name, Contractors: false));
+        }
+
+        AccountOptions = chosen;
+
+        Raise(nameof(AccountsFound));
+
+        // The new list arrives with the selection unresolved, so the account is said once more -
+        // now there is something in the list for the drop-down to match it against.
+        Selected?.RefreshSelectedAccount();
+    }
+
+    /// <summary>What the picker says underneath itself about how much it is showing.</summary>
+    public string AccountsFound =>
+        _chart.Count == 0
+            ? "Plan kont nie został wczytany."
+            : AccountOptions.Count >= AccountsShown
+                ? $"Pokazuję {AccountsShown} z {_chart.Count} kont – wpisz fragment numeru lub nazwy."
+                : $"{AccountOptions.Count} z {_chart.Count} kont.";
 
     /// <summary>
     /// The registers visible in the queue - the ones named in <c>appsettings.json</c>, narrowed
@@ -155,14 +269,78 @@ public sealed class MainViewModel : ObservableObject
 
     /// <summary>
     /// The settlement states shown on the list. By default the ones with work in them: untouched
-    /// transfers and those settled only in part. Fully settled ones are there to be looked at.
+    /// transfers and those settled only in part. Fully settled ones and those flagged "nie
+    /// rozliczaj" are there to be looked at - and, for the flagged ones, to be un-flagged.
     /// </summary>
     public IReadOnlyList<SettlementFilterOption> SettlementFilters { get; } =
+        SettlementFilterOption.ForQueue();
+
+    /// <summary>
+    /// Which side of the ledger is shown among the contractor's open items. Receivables only to
+    /// begin with - that is what an incoming transfer settles.
+    /// </summary>
+    public IReadOnlyList<DocumentSideOption> DocumentSideFilters { get; } =
     [
-        new(SettlementState.Unsettled, "nierozliczone", selected: true),
-        new(SettlementState.Partial, "rozliczone częściowo", selected: true),
-        new(SettlementState.Settled, "rozliczone w pełni", selected: false),
+        new("należności", isLiability: false, selected: true),
+        new("zobowiązania", isLiability: true, selected: true),
     ];
+
+    /// <summary>
+    /// The settlement state of the contractor's open items - the same filter as over the queue,
+    /// reading the same words. Items ERP is flagged not to settle start hidden: somebody has
+    /// already decided they are not going to be pursued.
+    /// </summary>
+    public IReadOnlyList<SettlementFilterOption> DocumentStateFilters { get; } =
+        SettlementFilterOption.ForDocuments();
+
+    public string DocumentSideFilterSummary => FilterOption.Summarize(DocumentSideFilters);
+
+    public string DocumentStateFilterSummary => FilterOption.Summarize(DocumentStateFilters);
+
+    /// <summary>
+    /// The document list as the grid shows it - the selected transfer's items put through the two
+    /// filters above.
+    /// </summary>
+    /// <remarks>
+    /// A fresh view per transfer, because each holds its own collection. Nothing is cached: the
+    /// list is at most a few hundred rows and the alternative is a dictionary of views to keep in
+    /// step with the queue.
+    /// </remarks>
+    public ICollectionView? DocumentsView
+    {
+        get => _documentsView;
+        private set => Set(ref _documentsView, value);
+    }
+
+    private ICollectionView? _documentsView;
+
+    /// <summary>
+    /// Whether a document belongs on the list.
+    /// </summary>
+    /// <remarks>
+    /// A ticked document always does, whatever is filtered out. Its amount is in the totals under
+    /// the list and it is about to be settled - hiding it would leave the sums unexplained, and a
+    /// correction the service itself matched is exactly the liability the default filter drops.
+    /// </remarks>
+    private bool ShowsDocument(DocumentItem document) =>
+        document.IsSelected
+        || (DocumentSideFilters.Any(f => f.IsSelected && f.IsLiability == document.Row.IsLiability)
+            && DocumentStateFilters.Any(f => f.IsSelected && f.State == document.SettlementState));
+
+    private void BuildDocumentsView(PaymentItem? item)
+    {
+        if (item is null)
+        {
+            DocumentsView = null;
+            return;
+        }
+
+        var view = new CollectionViewSource { Source = item.Documents }.View;
+        view.Filter = o => ShowsDocument((DocumentItem)o);
+        DocumentsView = view;
+    }
+
+    private void RefreshDocumentsView() => DocumentsView?.Refresh();
 
     // The text on the collapsed filters. The same rule computes them all, so they differ only
     // in the collection they summarise.
@@ -173,6 +351,16 @@ public sealed class MainViewModel : ObservableObject
     public string DirectionFilterSummary => FilterOption.Summarize(DirectionFilters);
 
     public string RegisterFilterSummary => FilterOption.Summarize(RegisterFilters);
+
+    /// <summary>Refreshes the document list when one of its own filters is ticked.</summary>
+    private void WatchDocuments(FilterOption option, string summaryProperty)
+    {
+        option.PropertyChanged += (_, _) =>
+        {
+            RefreshDocumentsView();
+            Raise(summaryProperty);
+        };
+    }
 
     /// <summary>Header of the counterparty column - it depends on the directions chosen.</summary>
     public string PartyHeader
@@ -207,11 +395,41 @@ public sealed class MainViewModel : ObservableObject
         get => _selected;
         set
         {
+            var previous = _selected;
+
             if (!Set(ref _selected, value)) return;
 
+            // A preview left on the row being left would outlive it: the picker would go on
+            // showing somebody else's account beside the contractor that is actually on the entry.
+            if (previous is not null) _ = PreviewAccountsAsync(previous, null);
+
             Raise(nameof(HasSelection));
+
+            // The search box is emptied along with the hits. Leaving the text behind over an empty
+            // list meant retyping the same name found nothing - the query had not changed, so no
+            // search ran - and the caption claimed there was nothing to find.
+            ContractorQuery = string.Empty;
             ContractorHits.Clear();
+
+            // The drop-down starts on the contractor the transfer already has, so the closed field
+            // reads the same as the column beside it. Assigned to the field: going through the
+            // property would preview accounts we are about to load anyway.
+            _contractorPick = value?.CurrentContractor;
+            Raise(nameof(ContractorPick));
+            RebuildContractorOptions();
             HideToast();
+            // Today's statement appears on disk during the day, so the archive is asked again on
+            // entering the row rather than only when the queue was loaded.
+            value?.RefreshSourceDocument(_documents.Find);
+
+            // A filter left over from the previous transfer would hide the new contractor's own
+            // accounts, which are the ones the operator wants first.
+            _accountFilter = string.Empty;
+            Raise(nameof(AccountFilter));
+            RebuildAccountOptions();
+
+            BuildDocumentsView(value);
+
             _ = LoadDocumentsAsync(value);
             RefreshCommands();
         }
@@ -250,24 +468,129 @@ public sealed class MainViewModel : ObservableObject
         set => Set(ref _from, value);
     }
 
+    /// <summary>
+    /// What is typed into the contractor box. Typing searches by itself from three characters on.
+    /// </summary>
+    /// <remarks>
+    /// Three, not two: two characters match thousands of cards on this register and the list that
+    /// comes back is no help. Below that the previous hits are cleared rather than left standing -
+    /// a list that no longer answers what is in the box invites choosing from it.
+    /// </remarks>
+    /// <summary>
+    /// The contractor highlighted in the hit list.
+    /// </summary>
+    /// <remarks>
+    /// Picking one is already a choice, so the account picker follows it at once - the accounts on
+    /// offer are that contractor's, and the head of the list is the one the settlement would use.
+    /// Nothing reaches ERP until the button is pressed: this is what the swap is going to look
+    /// like, shown before it happens, so the account can be corrected in the same breath.
+    ///
+    /// Dropping the highlight puts the transfer's own contractor back on the picker.
+    /// </remarks>
+    /// <summary>
+    /// What the contractor drop-down offers: the one in force, then whatever the search found.
+    /// </summary>
+    /// <remarks>
+    /// The one in force and the one picked are both kept in the list whatever is typed, for the
+    /// same reason the account picker keeps its own: a drop-down cannot show a selection that is
+    /// not among its entries, and emptying the search box would otherwise blank the field.
+    /// </remarks>
+    public IReadOnlyList<ContractorRow> ContractorOptions
+    {
+        get => _contractorOptions;
+        private set => Set(ref _contractorOptions, value);
+    }
+
+    private IReadOnlyList<ContractorRow> _contractorOptions = [];
+
+    private void RebuildContractorOptions()
+    {
+        var chosen = new List<ContractorRow>();
+        var taken = new HashSet<int>();
+
+        void Add(ContractorRow? row)
+        {
+            if (row is null || !taken.Add(row.Id)) return;
+            chosen.Add(row);
+        }
+
+        Add(ContractorPick);
+        Add(Selected?.CurrentContractor);
+        foreach (var hit in ContractorHits) Add(hit);
+
+        ContractorOptions = chosen;
+    }
+
+    public ContractorRow? ContractorPick
+    {
+        get => _contractorPick;
+        set
+        {
+            if (!Set(ref _contractorPick, value)) return;
+
+            RebuildContractorOptions();
+            _ = PreviewAccountsAsync(Selected, value?.Id);
+            RefreshCommands();
+        }
+    }
+
+    private ContractorRow? _contractorPick;
+
+    /// <summary>
+    /// Puts the accounts of the given contractor on the picker, without touching ERP.
+    /// </summary>
+    /// <param name="contractorId">
+    /// Null means "no pick": the transfer's own contractor, which is how a preview is undone.
+    /// </param>
+    private async Task PreviewAccountsAsync(PaymentItem? item, int? contractorId)
+    {
+        if (item is null) return;
+
+        var target = contractorId ?? item.EffectiveContractorId;
+        if (item.AccountOptionsFor == target)
+        {
+            if (ReferenceEquals(item, Selected)) RebuildAccountOptions();
+            return;
+        }
+
+        try
+        {
+            var accounts = target == 0 ? [] : await _repository.GetContractorAccountsAsync(target);
+            item.SetAccountOptions(accounts, target);
+
+            if (ReferenceEquals(item, Selected)) RebuildAccountOptions();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not read the accounts of contractor {Contractor}.", target);
+        }
+    }
+
     public string ContractorQuery
     {
         get => _contractorQuery;
-        set => Set(ref _contractorQuery, value);
+        set
+        {
+            if (!Set(ref _contractorQuery, value)) return;
+
+            _contractorSearch?.Cancel();
+            _contractorSearch = new CancellationTokenSource();
+
+            Raise(nameof(ContractorHitsSummary));
+
+            if (value.Trim().Length < ContractorQueryMinimum)
+            {
+                ContractorHits.Clear();
+                RebuildContractorOptions();
+                return;
+            }
+
+            _ = FindContractorsAsync(_contractorSearch.Token);
+        }
     }
 
-    public string DocumentQuery
-    {
-        get => _documentQuery;
-        set => Set(ref _documentQuery, value);
-    }
-
-    /// <summary>Narrows the queue to transfers the engine proposed anything for.</summary>
-    public bool OnlySuggested
-    {
-        get => _onlySuggested;
-        set { if (Set(ref _onlySuggested, value)) View.Refresh(); }
-    }
+    /// <summary>How much has to be typed before the register is searched.</summary>
+    private const int ContractorQueryMinimum = 3;
 
     // --------------------------------------------------------------- state ---
 
@@ -386,11 +709,8 @@ public sealed class MainViewModel : ObservableObject
     public RelayCommand SettleCheckedCommand { get; }
     public RelayCommand SettleCurrentCommand { get; }
     public RelayCommand RevokeCommand { get; }
-    public RelayCommand FindContractorCommand { get; }
-    public RelayCommand FindDocumentCommand { get; }
     public RelayCommand UseContractorCommand { get; }
     public RelayCommand AssignAccountCommand { get; }
-    public RelayCommand RestoreContractorCommand { get; }
     public RelayCommand DoNotSettleCommand { get; }
 
     // --------------------------------------------------------------- loading ---
@@ -535,6 +855,17 @@ public sealed class MainViewModel : ObservableObject
                 .GroupBy(s => s.PaymentId)
                 .ToDictionary(g => g.Key, g => (IReadOnlyList<SuggestionRow>)[.. g]);
 
+            // The accounts of every contractor on the list, in one query - the same reason the
+            // hints are fetched this way. Fetched per row as the operator clicked through, the
+            // column could only ever fill in for rows already visited, and the picker stayed shut
+            // until the query came back.
+            var accounts = await _repository.GetContractorAccountsAsync(
+                [.. queue.Select(r => r.ContractorId)]);
+
+            // The chart of accounts is read once and kept: the picker offers all of it, and per
+            // row it would be a megabyte and a half of text every time somebody clicked.
+            if (_chart.Count == 0) _chart = await _repository.GetChartOfAccountsAsync();
+
             foreach (var old in Payments) old.PropertyChanged -= OnPaymentChanged;
             Payments.Clear();
             Selected = null;
@@ -543,13 +874,21 @@ public sealed class MainViewModel : ObservableObject
             {
                 var item = new PaymentItem(row) { SourceDocument = _documents.Find(row) };
                 if (suggestions.TryGetValue(row.PaymentId, out var hits)) item.Suggestions = hits;
+
+                if (accounts.TryGetValue(row.ContractorId, out var forContractor))
+                {
+                    item.SetAccountOptions(forContractor, row.ContractorId);
+                }
+
                 item.PropertyChanged += OnPaymentChanged;
                 Payments.Add(item);
             }
 
             loading.Result(
                 $"{queue.Count} entries from {From:yyyy-MM-dd}, {suggestions.Count} with the engine's hints, "
-                + $"{RegisterFilters.Count} registers on the filter");
+                + $"{RegisterFilters.Count} registers on the filter, "
+                + $"{accounts.Count} contractors with accounts, "
+                + $"{_chart.Count} accounts in the plan");
 
             // Counters only after filtering - they count what is visible on the list.
             View.Refresh();
@@ -588,6 +927,8 @@ public sealed class MainViewModel : ObservableObject
             }
 
             await RefreshAccountKnownAsync(item);
+            await LoadOverpaymentAsync(item);
+            RebuildAccountOptions();
         }
         catch (Exception ex)
         {
@@ -597,6 +938,34 @@ public sealed class MainViewModel : ObservableObject
         finally
         {
             IsBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// Reads what the contractor has paid that nobody has allocated.
+    /// </summary>
+    /// <remarks>
+    /// A failure is not reported: it is a figure beside the totals, not something the settlement
+    /// depends on, and a toast about it would interrupt work that is not blocked.
+    /// </remarks>
+    private async Task LoadOverpaymentAsync(PaymentItem item)
+    {
+        var contractorId = item.EffectiveContractorId;
+
+        if (contractorId == 0)
+        {
+            item.Overpayments = [];
+            return;
+        }
+
+        try
+        {
+            item.Overpayments = await _repository.GetOverpaymentsAsync(contractorId, item.Row.ErpEntryId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not read the overpayment of contractor {Contractor}.", contractorId);
+            item.Overpayments = [];
         }
     }
 
@@ -653,7 +1022,13 @@ public sealed class MainViewModel : ObservableObject
 
     private void Fill(PaymentItem item, IReadOnlyList<DocumentRow> documents)
     {
-        foreach (var existing in item.Documents) existing.SelectionChanged -= item.RaiseTotals;
+        foreach (var existing in item.Documents)
+        {
+            existing.SelectionChanged -= item.RaiseTotals;
+            existing.SelectionChanged -= RefreshDocumentsView;
+            existing.DoNotSettleChanged -= OnDoNotSettleChanged;
+        }
+
         item.Documents.Clear();
 
         var suggested = item.Suggestions
@@ -664,7 +1039,12 @@ public sealed class MainViewModel : ObservableObject
         {
             var isSuggested = suggested.Contains((row.DocType, row.DocId, row.DocLp));
             var document = new DocumentItem(row, isSuggested, item.Row.IsIncoming);
+
+            // A tick can bring a document past the filter, and clearing one can take it away
+            // again - the list has to be re-run either way.
             document.SelectionChanged += item.RaiseTotals;
+            document.SelectionChanged += RefreshDocumentsView;
+            document.DoNotSettleChanged += OnDoNotSettleChanged;
             item.Documents.Add(document);
         }
 
@@ -675,48 +1055,86 @@ public sealed class MainViewModel : ObservableObject
 
     // ---------------------------------------------------------- contractor ---
 
-    private async Task FindContractorsAsync()
+    /// <summary>
+    /// Searches the register for what is in the box - after a short pause, so that a word being
+    /// typed does not send a query per keystroke.
+    /// </summary>
+    private async Task FindContractorsAsync(CancellationToken token)
     {
-        if (ContractorQuery.Trim().Length < 2)
-        {
-            Notify("Podaj co najmniej dwa znaki, żeby wyszukać kontrahenta.", ToastKind.Warning);
-            return;
-        }
-
         try
         {
-            IsBusy = true;
-            ContractorHits.Clear();
-            foreach (var hit in await _repository.FindContractorsAsync(ContractorQuery.Trim()))
-            {
-                ContractorHits.Add(hit);
-            }
+            await Task.Delay(TimeSpan.FromMilliseconds(250), token);
 
-            Notify($"Znaleziono {ContractorHits.Count} kontrahentów.");
+            var query = ContractorQuery.Trim();
+            if (query.Length < ContractorQueryMinimum) return;
+
+            var hits = await _repository.FindContractorsAsync(query, token);
+            if (token.IsCancellationRequested) return;
+
+            ContractorHits.Clear();
+            foreach (var hit in hits) ContractorHits.Add(hit);
+
+            RebuildContractorOptions();
+            Raise(nameof(ContractorHitsSummary));
+        }
+        catch (OperationCanceledException)
+        {
+            // Another key was pressed - the newer search answers instead.
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Contractor search failed.");
             Notify($"Błąd wyszukiwania kontrahenta: {ex.Message}", ToastKind.Error);
         }
-        finally
-        {
-            IsBusy = false;
-        }
     }
 
+    /// <summary>What is written under the hit list, so an empty list is not read as a failure.</summary>
+    public string ContractorHitsSummary => ContractorQuery.Trim().Length < ContractorQueryMinimum
+        ? $"Wpisz co najmniej {ContractorQueryMinimum} znaki – akronim, nazwę albo NIP."
+        : ContractorHits.Count == 0
+            ? "Nic nie znaleziono."
+            : $"Znaleziono {ContractorHits.Count}.";
+
+    /// <summary>
+    /// Puts the chosen contractor on the transfer: their open items are shown and the cash entry
+    /// in ERP is booked against them.
+    /// </summary>
+    /// <remarks>
+    /// The entry is written now rather than at settlement. An accountant swaps a contractor
+    /// exactly when the one on the entry is wrong, and an entry left on the wrong party until
+    /// something is settled cannot be found in ERP under either name in the meantime. The account
+    /// follows the party - it is chosen from that contractor's own, and the statement picks their
+    /// commonest when nothing is chosen.
+    /// </remarks>
     private async Task UseContractorAsync(ContractorRow? contractor)
     {
         if (contractor is null || Selected is null) return;
 
+        var item = Selected;
+
         try
         {
             IsBusy = true;
-            Selected.UseContractor(contractor.Id, contractor.Acronym, contractor.Display, byOperator: true);
-            await FillDocumentsAsync(Selected, contractor.Id);
-            Selected.DocumentsLoaded = true;
-            await RefreshAccountKnownAsync(Selected);
-            Notify($"Pokazuję nierozliczone dokumenty kontrahenta {contractor.Acronym}.");
+            item.UseContractor(contractor.Id, contractor.Acronym, contractor.Display, byOperator: true);
+
+            await FillDocumentsAsync(item, contractor.Id);
+            item.DocumentsLoaded = true;
+            await RefreshAccountKnownAsync(item);
+
+            // Loads the accounts only if the preview has not already done it - so an account the
+            // operator corrected on the picker before pressing the button is the one that is used,
+            // rather than being reset to the contractor's commonest.
+            await LoadAccountOptionsAsync(item);
+            await LoadOverpaymentAsync(item);
+
+            var account = item.SelectedAccount;
+            await Task.Run(() => _store.SetEntryContractor(
+                item.Row.PaymentId, item.Row.ErpEntryId, contractor.Id, account));
+
+            RefreshDocumentsView();
+
+            Notify($"Zapis kasowy przepisany na kontrahenta {contractor.Acronym}"
+                   + (string.IsNullOrEmpty(account) ? "." : $", konto {account}."));
         }
         catch (Exception ex)
         {
@@ -730,77 +1148,33 @@ public sealed class MainViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Returns to the contractor and documents the service worked out, discarding the manual swap.
+    /// Carries the "nie rozliczaj" box on a document payment through to ERP.
     /// </summary>
-    private async Task RestoreContractorAsync()
+    /// <remarks>
+    /// Written straight away rather than gathered up for a save button: it is one flag on one
+    /// payment, and the accountants set it while they are reading the list. If the write fails the
+    /// box goes back to what ERP still holds, so the screen never claims something the register
+    /// does not.
+    /// </remarks>
+    private async void OnDoNotSettleChanged(DocumentItem document)
     {
-        if (Selected is not { ContractorOverridden: true } item) return;
+        var wanted = document.DoNotSettle;
 
         try
         {
-            IsBusy = true;
-            item.RestoreServiceContractor();
-            ContractorHits.Clear();
-            ContractorQuery = string.Empty;
+            await Task.Run(() => _store.SetPaymentDoNotSettle(
+                document.Row.DocType, document.Row.DocId, document.Row.DocLp, wanted));
 
-            await FillDocumentsAsync(item, item.Row.ContractorId);
-            item.DocumentsLoaded = true;
-            await RefreshAccountKnownAsync(item);
-
-            Notify("Przywrócono kontrahenta i dokumenty wskazane przez serwis.");
+            RefreshDocumentsView();
+            Notify(wanted
+                ? $"{document.DocNumber}: ustawiono „nie rozliczaj”."
+                : $"{document.DocNumber}: zdjęto „nie rozliczaj”.");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Could not restore the contractor.");
-            Notify($"Błąd przywracania kontrahenta: {ex.Message}", ToastKind.Error);
-        }
-        finally
-        {
-            IsBusy = false;
-        }
-    }
-
-    /// <summary>Appends documents found by number to the list - without swapping the contractor.</summary>
-    private async Task FindDocumentsAsync()
-    {
-        if (Selected is null) return;
-        if (!int.TryParse(new string([.. DocumentQuery.Where(char.IsDigit)]), out var number) || number == 0)
-        {
-            Notify("Podaj numer dokumentu, na przykład 33575.", ToastKind.Warning);
-            return;
-        }
-
-        try
-        {
-            IsBusy = true;
-            var hits = await _repository.FindDocumentsByNumberAsync(number);
-            var known = Selected.Documents
-                .Select(d => (d.Row.DocType, d.Row.DocId, d.Row.DocLp))
-                .ToHashSet();
-
-            var added = 0;
-            foreach (var row in hits.Where(h => !known.Contains((h.DocType, h.DocId, h.DocLp))))
-            {
-                var document = new DocumentItem(row, false, Selected.Row.IsIncoming);
-                document.SelectionChanged += Selected.RaiseTotals;
-                Selected.Documents.Add(document);
-                added++;
-            }
-
-            Notify(
-                added == 0
-                    ? $"Nie znaleziono nierozliczonych dokumentów o numerze {number}."
-                    : $"Dołączono {added} dokumentów o numerze {number}.",
-                added == 0 ? ToastKind.Warning : ToastKind.Info);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Document search failed.");
-            Notify($"Błąd wyszukiwania dokumentu: {ex.Message}", ToastKind.Error);
-        }
-        finally
-        {
-            IsBusy = false;
+            _logger.LogError(ex, "Could not change the do-not-settle flag on {Document}.", document.DocNumber);
+            document.ResetDoNotSettle(!wanted);
+            Notify($"Nie udało się zmienić znacznika: {ex.Message}", ToastKind.Error);
         }
     }
 
@@ -825,18 +1199,52 @@ public sealed class MainViewModel : ObservableObject
     }
 
     /// <summary>
+    /// Which way the one button goes: on unless every transfer it would act on already carries the
+    /// flag, and then it takes it off.
+    /// </summary>
+    /// <remarks>
+    /// One button rather than two. Setting and clearing are the same decision seen from opposite
+    /// sides, and a second button would sit greyed out most of the time - the accountant would
+    /// still have to read which one is live. This way the caption says what will happen.
+    ///
+    /// A mixed selection sets rather than clears: ticking a dozen transfers of which one is
+    /// already flagged means "flag these", and the flagged one is simply left as it is.
+    /// </remarks>
+    private bool DoNotSettleSets() => DoNotSettleTargets().Any(i => !i.IsDoNotSettle);
+
+    /// <summary>The caption on that button.</summary>
+    public string DoNotSettleLabel =>
+        DoNotSettleSets() ? "Oznacz: nie rozliczaj" : "Zdejmij: nie rozliczaj";
+
+    /// <summary>What its tooltip explains - the two directions read differently.</summary>
+    public string DoNotSettleHint => DoNotSettleSets()
+        ? "Ustawia w ERP znacznik „nie podlega rozliczeniu” – dla prowizji, zwrotów i przeksięgowań. "
+          + "Działa na zaznaczonych przelewach, a gdy nic nie jest zaznaczone – na bieżącym."
+        : "Zdejmuje znacznik „nie podlega rozliczeniu” i wraca przelew do kolejki. "
+          + "Działa na zaznaczonych przelewach, a gdy nic nie jest zaznaczone – na bieżącym.";
+
+    /// <summary>
     /// Marks the given transfers as not subject to settlement - one at a time or in bulk.
     /// </summary>
     private async Task MarkDoNotSettleAsync()
     {
-        var items = DoNotSettleTargets();
+        var sets = DoNotSettleSets();
+
+        // Clearing touches only the flagged ones; setting only those without the flag. Either way
+        // the transfers already in the wanted state are left alone rather than written twice.
+        var items = DoNotSettleTargets().Where(i => i.IsDoNotSettle != sets).ToList();
         if (items.Count == 0) return;
 
-        var skipped = (CheckedCount > 0 ? CheckedCount : Selected is null ? 0 : 1) - items.Count;
+        var considered = CheckedCount > 0 ? CheckedCount : Selected is null ? 0 : 1;
+        var skipped = considered - DoNotSettleTargets().Count;
 
-        var question = items.Count == 1
-            ? "Oznaczyć ten przelew w ERP jako niepodlegający rozliczeniu?"
-            : $"Oznaczyć {items.Count} przelewów w ERP jako niepodlegające rozliczeniu?";
+        var question = sets
+            ? items.Count == 1
+                ? "Oznaczyć ten przelew w ERP jako niepodlegający rozliczeniu?"
+                : $"Oznaczyć {items.Count} przelewów w ERP jako niepodlegające rozliczeniu?"
+            : items.Count == 1
+                ? "Zdjąć z tego przelewu znacznik „nie podlega rozliczeniu” i wrócić go do kolejki?"
+                : $"Zdjąć znacznik „nie podlega rozliczeniu” z {items.Count} przelewów?";
 
         if (skipped > 0)
         {
@@ -852,21 +1260,27 @@ public sealed class MainViewModel : ObservableObject
             IsBusy = true;
             await Task.Run(() =>
             {
-                foreach (var (paymentId, entryId) in plan) _store.MarkDoNotSettle(paymentId, entryId, User);
+                foreach (var (paymentId, entryId) in plan)
+                {
+                    if (sets) _store.MarkDoNotSettle(paymentId, entryId, User);
+                    else _store.ClearDoNotSettle(paymentId, entryId, User);
+                }
             });
 
             await ReloadAndAdvanceAsync(plan[^1].PaymentId);
 
+            var done = sets
+                ? $"Oznaczono {plan.Count} przelewów jako niepodlegające rozliczeniu."
+                : $"Zdjęto znacznik z {plan.Count} przelewów – wróciły do kolejki.";
+
             Notify(
-                skipped == 0
-                    ? $"Oznaczono {plan.Count} przelewów jako niepodlegające rozliczeniu."
-                    : $"Oznaczono {plan.Count} przelewów. Pominięto {skipped} częściowo rozliczonych.",
+                skipped == 0 ? done : $"{done} Pominięto {skipped} częściowo rozliczonych.",
                 skipped == 0 ? ToastKind.Success : ToastKind.Warning);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Marking as not subject to settlement failed.");
-            Notify($"Błąd oznaczania: {ex.Message}", ToastKind.Error);
+            _logger.LogError(ex, "Changing the do-not-settle flag failed.");
+            Notify($"Błąd zmiany znacznika: {ex.Message}", ToastKind.Error);
         }
         finally
         {
@@ -879,16 +1293,21 @@ public sealed class MainViewModel : ObservableObject
         // A fully settled entry has nothing left to settle - it is on the list only because the
         // state filter let it through, and clicking Settle would end in an error from ERP.
         var closed = items.Count(i => i.SettlementState == SettlementState.Settled);
+
+        // A transfer flagged "nie rozliczaj" is not an open item either - the flag has to come
+        // off first, which is what the button beside this one does.
+        var flagged = items.Count(i => i.IsDoNotSettle);
         var pending = items
-            .Where(i => i.SettlementState != SettlementState.Settled && i.Selected.Count > 0)
+            .Where(i => i.SettlementState is not (SettlementState.Settled or SettlementState.DoNotSettle)
+                        && i.Selected.Count > 0)
             .ToList();
 
         if (pending.Count == 0)
         {
             Notify(
-                closed > 0
-                    ? "Zaznaczone przelewy są już rozliczone w całości."
-                    : "Nie zaznaczono żadnego dokumentu do rozliczenia.",
+                closed > 0 ? "Zaznaczone przelewy są już rozliczone w całości."
+                : flagged > 0 ? "Zaznaczone przelewy mają w ERP znacznik „nie rozliczaj” – najpierw go zdejmij."
+                : "Nie zaznaczono żadnego dokumentu do rozliczenia.",
                 ToastKind.Warning);
             return;
         }
@@ -911,6 +1330,7 @@ public sealed class MainViewModel : ObservableObject
                 i.Row.ErpEntryId,
                 i.Remaining,
                 i.EffectiveContractorId,
+                i.AccountForSettlement,
                 [.. i.Selected.Select(d => new SettlementLine(
                     d.Row.DocType, d.Row.DocId, d.Row.DocLp, d.DocNumber, d.SignedRemaining))]))
             .ToList();
@@ -1037,6 +1457,11 @@ public sealed class MainViewModel : ObservableObject
         int EntryId,
         decimal EntryAmount,
         int ContractorId,
+        /// <summary>
+        /// The account picked in the panel, empty when none was. Empty leaves the choice to the
+        /// same rule the service uses - the account this contractor's other entries carry.
+        /// </summary>
+        string Account,
         IReadOnlyList<SettlementLine> Lines);
 
     /// <summary>Runs on the XL session's thread - with no await inside.</summary>
@@ -1056,8 +1481,14 @@ public sealed class MainViewModel : ObservableObject
                 // name whoever the open item actually closed with.
                 if (request.ContractorId != 0)
                 {
-                    _store.UpdateEntryContractor(request.PaymentId, request.EntryId, request.ContractorId);
+                    _store.UpdateEntryContractor(
+                        request.PaymentId, request.EntryId, request.ContractorId, request.Account);
                 }
+
+                // And it names the invoices it paid instead of the bank's reference - the same as
+                // when the service settles, so an entry reads the same whoever closed it.
+                _store.UpdateEntryDocumentNumber(
+                    request.EntryId, [.. request.Lines.Select(l => l.DocNumber)]);
 
                 _store.MarkSettled(request.PaymentId, User);
             }
@@ -1195,7 +1626,8 @@ public sealed class MainViewModel : ObservableObject
         if (found is not null)
         {
             await Task.Run(() => _store.RepairBankForIban(
-                found.Id, entered.BankCode, entered.Name, entered.City, entered.PostalCode));
+                found.Id, entered.BankCode, entered.Name, entered.City, entered.PostalCode,
+                entered.Street));
 
             if (entered.Bic.Length > 0) _bankBics[found.Id] = entered.Bic;
             return found with { BindsInXl = true };
@@ -1204,7 +1636,8 @@ public sealed class MainViewModel : ObservableObject
         var name = entered.Name.Length > 0 ? entered.Name : item.Row.BankName;
 
         var created = await Task.Run(() => _store.CreateBank(
-            entered.Bic, name, entered.BankCode, entered.CountryCode, entered.City, entered.PostalCode));
+            entered.Bic, name, entered.BankCode, entered.CountryCode, entered.City, entered.PostalCode,
+            entered.Street));
 
         if (created is not null && entered.Bic.Length > 0) _bankBics[created.Id] = entered.Bic;
 
@@ -1257,6 +1690,47 @@ public sealed class MainViewModel : ObservableObject
     /// attached to the contractor actually chosen - including where the operator corrected the
     /// service's suggestion.
     /// </remarks>
+    /// <summary>
+    /// Fills the account list with the accounts of the contractor the transfer is settled with.
+    /// </summary>
+    /// <remarks>
+    /// Fetched when a transfer is selected and again whenever the contractor changes, because the
+    /// list belongs to the contractor and not to the transfer. Fetched once per contractor - the
+    /// query counts entries and there is no reason to repeat it on every click through the queue.
+    ///
+    /// A failure here is not reported: the list is a convenience, the box beside it stays editable,
+    /// and a toast about it would interrupt work that is not blocked.
+    /// </remarks>
+    private async Task LoadAccountOptionsAsync(PaymentItem? item)
+    {
+        if (item is null) return;
+
+        var contractorId = item.EffectiveContractorId;
+
+        if (contractorId == 0)
+        {
+            item.SetAccountOptions([], 0);
+            return;
+        }
+
+        if (item.AccountOptionsFor == contractorId) return;
+
+        try
+        {
+            var accounts = await _repository.GetContractorAccountsAsync(contractorId);
+            item.SetAccountOptions(accounts, contractorId);
+
+            // The picker's list belongs to the window, so loading the item's accounts is only half
+            // of it - without this the drop-down went on offering the previous contractor's
+            // accounts at the top after a swap.
+            if (ReferenceEquals(item, Selected)) RebuildAccountOptions();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not read the accounts of contractor {Contractor}.", contractorId);
+        }
+    }
+
     private async Task AssignAccountAsync()
     {
         if (Selected is not { CanAssignAccount: true } item) return;
@@ -1340,7 +1814,6 @@ public sealed class MainViewModel : ObservableObject
         if (!RegisterFilters.Any(f => f.IsSelected && f.Series == item.RegisterSeries)) return false;
         if (!ConfidenceFilters.Any(f => f.IsSelected && f.Label == item.ConfidenceLabel)) return false;
         if (!DirectionFilters.Any(f => f.IsSelected && f.IsIncoming == item.Row.IsIncoming)) return false;
-        if (OnlySuggested && item.Suggestions.Count == 0) return false;
 
         if (Search.Trim().Length == 0) return true;
 
@@ -1367,11 +1840,11 @@ public sealed class MainViewModel : ObservableObject
         SettleCheckedCommand.RaiseCanExecuteChanged();
         SettleCurrentCommand.RaiseCanExecuteChanged();
         RevokeCommand.RaiseCanExecuteChanged();
-        FindContractorCommand.RaiseCanExecuteChanged();
-        FindDocumentCommand.RaiseCanExecuteChanged();
         UseContractorCommand.RaiseCanExecuteChanged();
         AssignAccountCommand.RaiseCanExecuteChanged();
-        RestoreContractorCommand.RaiseCanExecuteChanged();
         DoNotSettleCommand.RaiseCanExecuteChanged();
+
+        Raise(nameof(DoNotSettleLabel));
+        Raise(nameof(DoNotSettleHint));
     }
 }

@@ -1,6 +1,7 @@
 using System.Windows.Controls;
 using System.Windows;
 using Gaska.Payments.Desktop.Data;
+using Gaska.Payments.Desktop.Mvvm;
 
 namespace Gaska.Payments.Desktop.Views;
 
@@ -38,6 +39,7 @@ public partial class BankWindow : Window
 
         BicBox.Text = known?.Bic ?? string.Empty;
         NameBox.Text = known?.Name ?? string.Empty;
+        StreetBox.Text = known?.Street ?? string.Empty;
         CityBox.Text = known?.City ?? string.Empty;
         PostalCodeBox.Text = known?.PostalCode ?? string.Empty;
 
@@ -69,6 +71,13 @@ public partial class BankWindow : Window
               "Po nim, i tylko po nim, ERP XL wiąże bank z rachunkiem."
             : $"Nie znamy układu numeru rachunku w kraju {IbanParts.Country(prompt.Account)}, " +
               "więc kod banku trzeba wskazać samemu – to ta część numeru, która opisuje bank.";
+
+        // The window sizes itself to its content and cannot be resized, so on a small screen -
+        // or a normal one at 150% scaling - it would simply be taller than the desktop, with the
+        // buttons under the edge and no way to reach them. Capped to the screen; the content
+        // scrolls inside whatever is left.
+        SourceInitialized += (_, _) =>
+            MaxHeight = Math.Max(320, ScreenArea.WorkAreaFor(this).Height - (2 * ScreenArea.Gap));
 
         Loaded += (_, _) =>
         {
@@ -136,12 +145,145 @@ public partial class BankWindow : Window
         Result = new BankDetails(
             bic,
             NameBox.Text.Trim(),
+            StreetBox.Text.Trim(),
             CityBox.Text.Trim(),
             PostalCodeBox.Text.Trim(),
             CountryBox.Text.Trim(),
             code);
 
         DialogResult = true;
+    }
+
+    /// <summary>
+    /// Fetches what the public IBAN register knows about this bank and fills the fields with it.
+    /// </summary>
+    /// <remarks>
+    /// The page stays open beside the form. Nothing here is taken on trust: the operator reads the
+    /// page the fields came from and corrects whatever the register got wrong before confirming.
+    /// </remarks>
+    private async void OnLookUp(object sender, RoutedEventArgs e)
+    {
+        var account = AccountBox.Text.Trim();
+
+        if (account.Length < 10)
+        {
+            Fail("Bez numeru rachunku nie ma czego sprawdzić.", BankCodeBox);
+            return;
+        }
+
+        ErrorText.Visibility = Visibility.Collapsed;
+        LookupButton.IsEnabled = false;
+        LookupButton.Content = "Sprawdzam…";
+
+        try
+        {
+            var opening = _preview is null;
+            _preview ??= NewPreview();
+
+            // Laid out before it is shown, so the pair does not jump into place in front of the
+            // operator. Only on opening - a window they have since moved stays where they put it.
+            if (opening) ArrangeSideBySide(_preview);
+
+            _preview.Show();
+            _preview.Activate();
+
+            var found = await _preview.LookUpAsync(account);
+
+            if (!found.HasAnything)
+            {
+                Fail(found.Message.Length > 0
+                        ? found.Message
+                        : "Strona nie podaje danych tego banku – wpisz je z dokumentu.",
+                    NameBox);
+                return;
+            }
+
+            Fill(found);
+        }
+        catch (Exception exception)
+        {
+            Fail($"Nie udało się pobrać danych banku: {exception.Message}", NameBox);
+        }
+        finally
+        {
+            LookupButton.IsEnabled = true;
+            LookupButton.Content = "Pobierz dane z sieci";
+        }
+    }
+
+    private IbanPreviewWindow? _preview;
+
+    /// <summary>
+    /// The preview, owned by this window so that closing the form closes it as well.
+    /// </summary>
+    private IbanPreviewWindow NewPreview()
+    {
+        var preview = new IbanPreviewWindow { Owner = this };
+        preview.Closed += (_, _) => _preview = null;
+
+        return preview;
+    }
+
+    /// <summary>
+    /// Puts the form on the left and the page on the right, side by side, neither covering the
+    /// other.
+    /// </summary>
+    /// <remarks>
+    /// The form opens in the middle of the screen, so a page placed beside it would hang off the
+    /// edge or sit on top of it. The two are measured together and centred as a pair, on the
+    /// screen the form is actually on.
+    ///
+    /// Done once, when the page is first opened. Whatever the operator drags afterwards stays
+    /// where they dragged it.
+    /// </remarks>
+    private void ArrangeSideBySide(Window preview)
+    {
+        var (form, page) = ScreenArea.PairSideBySide(
+            ScreenArea.WorkAreaFor(this),
+            new Size(ActualWidth > 0 ? ActualWidth : Width, ActualHeight > 0 ? ActualHeight : Height),
+            new Size(preview.Width, preview.Height));
+
+        // The form sizes itself to its content, so only its position is set.
+        Left = form.Left;
+        Top = form.Top;
+
+        preview.Left = page.Left;
+        preview.Top = page.Top;
+        preview.Width = page.Width;
+        preview.Height = page.Height;
+    }
+
+    /// <summary>
+    /// Writes into the form what the register returned, leaving anything it does not know alone.
+    /// </summary>
+    /// <remarks>
+    /// The bank code is the exception and is taken only when it stands where a bank code belongs
+    /// in this account number. It is the one field ERP matches on, our own value comes from the
+    /// IBAN registry, and a register that counts the digits differently for some country must not
+    /// be allowed to overwrite it - a card created under a code XL will not find is a card that
+    /// exists and does nothing.
+    /// </remarks>
+    private void Fill(IbanLookupResult found)
+    {
+        if (found.Bic.Length > 0) BicBox.Text = found.Bic;
+        if (found.Name.Length > 0) NameBox.Text = found.Name;
+        if (found.Street.Length > 0) StreetBox.Text = found.Street;
+        if (found.City.Length > 0) CityBox.Text = found.City;
+        if (found.PostalCode.Length > 0) PostalCodeBox.Text = found.PostalCode;
+
+        if (BankCodeBox.Text.Trim().Length == 0 && found.BankCode.Length > 0 && Fits(found.BankCode))
+        {
+            BankCodeBox.Text = found.BankCode;
+        }
+
+        var ignored = found.BankCode.Length > 0
+                      && !string.Equals(found.BankCode, BankCodeBox.Text.Trim(), StringComparison.OrdinalIgnoreCase);
+
+        SourceText.Text = ignored
+            ? $"Dane z ibancalculator.com. Kod banku ze strony ({found.BankCode}) różni się od "
+              + $"wyliczonego z numeru ({BankCodeBox.Text.Trim()}) – zostawiam wyliczony, bo to po nim "
+              + "ERP XL wiąże bank z rachunkiem. Porównaj resztę z otwartą stroną."
+            : "Dane z ibancalculator.com – porównaj je z otwartą obok stroną i popraw, jeśli trzeba.";
     }
 
     private void Fail(string message, Control focus)

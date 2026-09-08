@@ -67,7 +67,8 @@ public sealed record PendingOperation(
 }
 
 /// <summary>An entry already created in ERP that is waiting only to be settled.</summary>
-public sealed record PendingSettlement(long PaymentId, int EntryId, decimal Amount, string RegisterSeries);
+public sealed record PendingSettlement(
+    long PaymentId, int EntryId, decimal Amount, string RegisterSeries, int ContractorId);
 
 /// <summary>A settlement line: the document payment part of the entry is to go to.</summary>
 public sealed record PendingAllocation(
@@ -119,7 +120,11 @@ public sealed class PostingRepository(string connectionString)
     /// </summary>
     /// <remarks>
     /// For bank operations the link runs through the bank reference, which we store in
-    /// <c>KAZ_NumerDokumentu</c>.
+    /// <c>KAZ_NumerDokumentu</c> - up until the entry is settled, when that column is rewritten
+    /// with the numbers of the documents it closed (see
+    /// <see cref="CashEntrySql.SetEntryDocumentNumber"/>). Nothing is lost by that: a settled
+    /// operation already holds its <c>ErpEntryId</c> and never reaches this pass, and were our
+    /// table ever rebuilt the content-based pairing below would find the entry anyway.
     ///
     /// Cash on delivery is matched on the waybill in the entry's text instead, and only within its
     /// own register. Its entries carry the invoice number in <c>KAZ_NumerDokumentu</c> - the form
@@ -520,7 +525,7 @@ public sealed class PostingRepository(string connectionString)
         var parameters = registers.Select((_, i) => $"@r{i}").ToArray();
 
         var sql = $"""
-            SELECT TOP (@limit) p.PaymentId, p.ErpEntryId, p.Amount, p.RegisterSeries
+            SELECT TOP (@limit) p.PaymentId, p.ErpEntryId, p.Amount, p.RegisterSeries, p.ContractorId
             FROM pay.Payment AS p
             INNER JOIN CDN.Zapisy AS z ON z.KAZ_GIDNumer = p.ErpEntryId
             WHERE p.ErpEntryId IS NOT NULL
@@ -550,7 +555,8 @@ public sealed class PostingRepository(string connectionString)
         while (await reader.ReadAsync(cancellationToken))
         {
             rows.Add(new PendingSettlement(
-                reader.GetInt64(0), reader.GetInt32(1), reader.GetDecimal(2), reader.GetString(3)));
+                reader.GetInt64(0), reader.GetInt32(1), reader.GetDecimal(2), reader.GetString(3),
+                reader.GetInt32(4)));
         }
 
         return rows;

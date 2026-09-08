@@ -1,4 +1,4 @@
-using Gaska.Payments.Desktop.Data;
+﻿using Gaska.Payments.Desktop.Data;
 using Gaska.Payments.Desktop.Mvvm;
 
 namespace Gaska.Payments.Desktop.ViewModels;
@@ -24,9 +24,15 @@ public abstract class FilterOption(string label, bool selected) : ObservableObje
     }
 
     /// <summary>
-    /// The text on the collapsed filter. With a longer list only the count is given - the names
-    /// of six registers would not fit on the button anyway.
+    /// The text on the collapsed filter: the name while exactly one entry is ticked, the count
+    /// from two on.
     /// </summary>
+    /// <remarks>
+    /// Two names already make the button wider than the filters beside it - "nierozliczone,
+    /// rozliczone częściowo" is the settlement filter's own default - and the bar has to fit six
+    /// of these. One name is worth spelling out because it says what the list is narrowed to; past
+    /// that the ticks in the open list say it better than a caption can.
+    /// </remarks>
     public static string Summarize(IReadOnlyCollection<FilterOption> options)
     {
         var chosen = options.Where(o => o.IsSelected).ToList();
@@ -35,7 +41,7 @@ public abstract class FilterOption(string label, bool selected) : ObservableObje
         {
             0 => "nic nie wybrano",
             var n when n == options.Count => "wszystkie",
-            var n when n <= 3 => string.Join(", ", chosen.Select(o => o.Label)),
+            1 => chosen[0].Label,
             var n => $"wybrano {n} z {options.Count}",
         };
     }
@@ -89,7 +95,54 @@ public sealed class SettlementFilterOption(SettlementState state, string label, 
     : FilterOption(label, selected)
 {
     public SettlementState State { get; } = state;
+
+    /// <summary>
+    /// The states a transfer in the queue can be in.
+    /// </summary>
+    /// <remarks>
+    /// Fully settled ones and those flagged "nie rozliczaj" start unticked: both are finished
+    /// business, and the queue is a list of work. They are one tick away, which is what makes it
+    /// possible to find a transfer somebody flagged by mistake and take the flag off again.
+    /// </remarks>
+    public static IReadOnlyList<SettlementFilterOption> ForQueue() =>
+    [
+        new(SettlementState.Unsettled, "nierozliczone", selected: true),
+        new(SettlementState.Partial, "rozliczone częściowo", selected: true),
+        new(SettlementState.Settled, "rozliczone w pełni", selected: false),
+        new(SettlementState.DoNotSettle, "nie rozliczaj", selected: false),
+    ];
+
+    /// <summary>
+    /// The same filter over a contractor's open items.
+    /// </summary>
+    /// <remarks>
+    /// Three states, not four: a payment settled in full has nothing left on it and is never
+    /// loaded, so an entry for it would be a tick that changes nothing.
+    /// </remarks>
+    public static IReadOnlyList<SettlementFilterOption> ForDocuments() =>
+    [
+        new(SettlementState.Unsettled, "nierozliczone", selected: true),
+        new(SettlementState.Partial, "rozliczone częściowo", selected: true),
+        new(SettlementState.DoNotSettle, "nie rozliczaj", selected: false),
+    ];
 }
+
+/// <summary>An entry in the document side filter - a receivable or a liability.</summary>
+/// <remarks>
+/// Both sides ticked by default. A contractor who both buys and sells is settled across the two -
+/// a purchase invoice nets off against a receivable - so a list showing one side is a list that
+/// does not add up. The filter is there to narrow it down when somebody wants that, not to decide
+/// for them.
+///
+/// A ticked document is shown whatever the filter says: hiding one would hide money that is about
+/// to be settled while its amount still stands in the totals underneath.
+/// </remarks>
+public sealed class DocumentSideOption(string label, bool isLiability, bool selected)
+    : FilterOption(label, selected)
+{
+    public bool IsLiability { get; } = isLiability;
+}
+
 
 /// <summary>
 /// The icon shown beside a bank register's symbol.

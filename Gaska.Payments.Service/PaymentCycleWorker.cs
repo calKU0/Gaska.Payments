@@ -206,7 +206,9 @@ public sealed class PaymentCycleWorker(
 
             var summary = await statements.RunAsync(cancellationToken);
 
-            step.Result($"{summary.Saved} saved, {summary.Unavailable} days the bank had none for");
+            step.Result(
+                $"{summary.Saved} saved, {summary.Refreshed} refreshed (today's still open), "
+                + $"{summary.Unavailable} days the bank had none for");
 
             if (summary.Saved > 0)
             {
