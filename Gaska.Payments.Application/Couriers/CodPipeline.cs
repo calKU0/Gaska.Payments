@@ -1,4 +1,4 @@
-using Gaska.Payments.Application.Settlement;
+﻿using Gaska.Payments.Application.Settlement;
 using Gaska.Payments.Domain.Diagnostics;
 using Gaska.Payments.Integrations.Archive;
 using Microsoft.Extensions.Logging;
@@ -290,6 +290,12 @@ public sealed class CodPipeline(
             return summary with { Waiting = summary.Waiting + 1 };
         }
 
+        if (report.PaysPerParcel)
+        {
+            return await SettlePerParcelAsync(
+                row, report, payouts, posted, runId, summary, cancellationToken);
+        }
+
         var match = payouts
             .Select(p => p.Match(report))
             .Where(m => m.Found)
@@ -368,16 +374,121 @@ public sealed class CodPipeline(
         };
     }
 
+    /// <summary>
+    /// A report whose parcels are each paid by a transfer of their own.
+    /// </summary>
+    /// <remarks>
+    /// Hellmann only. Its file is a running list rather than a payout: the same rows come back in
+    /// the next file, most of them long since paid, and each parcel is settled by a transfer whose
+    /// title carries the order number from the first column - sometimes with the invoice number
+    /// after it, as in "1014118551, FS-38408/26/SPR".
+    ///
+    /// So there is nothing to check a total against, and instead each parcel is paired with its
+    /// own transfer on two conditions at once: the title names the order number, and the transfer
+    /// is worth exactly what the row says. Both, because an order number is ten digits and could
+    /// in principle turn up inside another number, and because an amount alone says nothing at
+    /// all. That is a stricter test per parcel than the collective one it replaces.
+    ///
+    /// A transfer answers to one parcel and no other, so a title naming two order numbers cannot
+    /// pay for both. Parcels whose money has not arrived are simply left - the file lists them
+    /// long before Hellmann pays.
+    /// </remarks>
+    private async Task<CodSummary> SettlePerParcelAsync(
+        CodReportRow row, CodReport report, IReadOnlyList<CodPayout> payouts, HashSet<string> posted,
+        int runId, CodSummary summary, CancellationToken cancellationToken)
+    {
+        var taken = new HashSet<int>();
+        var paid = new Dictionary<string, CodPayout>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var parcel in report.Parcels)
+        {
+            if (posted.Contains(parcel.Waybill)) continue;
+
+            var digits = new string([.. parcel.Waybill.Where(char.IsAsciiDigit)]);
+            if (digits.Length < 6) continue;
+
+            // The takeover date belongs to the transfer here, not to the file: the list reaches
+            // back months and those parcels were entered by hand long ago.
+            var payout = payouts.FirstOrDefault(p =>
+                !taken.Contains(p.EntryId)
+                && p.BookedOn.Date >= _options.PostFrom.Date
+                && Math.Abs(p.Amount - parcel.Amount) <= 0.004m
+                && p.Digits.Contains(digits, StringComparison.Ordinal));
+
+            if (payout is null) continue;
+
+            taken.Add(payout.EntryId);
+            paid[parcel.Waybill] = payout;
+        }
+
+        if (paid.Count == 0)
+        {
+            logger.LogDebug(
+                "No transfers yet for any of the {Count} parcels in the {Courier} report {File}.",
+                report.Parcels.Count, row.Courier, Path.GetFileName(row.FilePath));
+
+            return summary with { Waiting = summary.Waiting + 1 };
+        }
+
+        logger.LogInformation(
+            "The {Courier} report {File}: {Paid} of {Count} parcels have their own transfer, " +
+            "worth {Total:N2} together.",
+            row.Courier, Path.GetFileName(row.FilePath), paid.Count, report.Parcels.Count,
+            paid.Values.Sum(p => p.Amount));
+
+        // Every entry is dated by its own transfer, so the date passed here is never the one used -
+        // only the parcels in "paid" are proposed at all. It is stated as the file's date rather
+        // than today's so that loosening that filter would show up as an obviously wrong date
+        // rather than as a silent "booked today".
+        var counts = await ProposeAsync(
+            report, row.Courier, row.FilePath, report.PayoutDate, settleable: true,
+            posted, runId, cancellationToken, paid);
+
+        var remaining = report.Parcels.Count(p => !posted.Contains(p.Waybill) && !paid.ContainsKey(p.Waybill));
+
+        await store.SaveAsync(row with
+        {
+            // The row stays open while any parcel could still be paid: this file is a list, and the
+            // next transfer against it may be weeks away.
+            Status = remaining == 0 ? CodReportStatus.Posted : CodReportStatus.Pending,
+            ParcelCount = report.Parcels.Count,
+            Note = $"{paid.Count} parcels paid one by one, {remaining} still waiting",
+        }, cancellationToken);
+
+        return summary with
+        {
+            Posted = summary.Posted + (remaining == 0 ? 1 : 0),
+            Waiting = summary.Waiting + (remaining == 0 ? 0 : 1),
+            ParcelsProposed = summary.ParcelsProposed + counts.Proposed,
+            ParcelsSkipped = summary.ParcelsSkipped + counts.Skipped,
+            WithoutDocuments = summary.WithoutDocuments + counts.WithoutDocuments,
+        };
+    }
+
     private async Task<(int Proposed, int Skipped, int WithoutDocuments)> ProposeAsync(
         CodReport report, string courier, string path, DateTime bookedOn, bool settleable,
-        HashSet<string> posted, int runId, CancellationToken cancellationToken)
+        HashSet<string> posted, int runId, CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, CodPayout>? perParcel = null)
     {
         var pending = report.Parcels.Where(p => !posted.Contains(p.Waybill)).ToList();
+
+        // Counted before the next filter, so that "already in ERP" means exactly that. With a
+        // courier paying parcel by parcel most of the file is neither posted nor payable yet, and
+        // lumping the two together would report 62 parcels as booked that nobody has booked.
         var skipped = report.Parcels.Count - pending.Count;
+
+        // Parcels whose transfer has not arrived are not proposed at all - with a courier paying
+        // one at a time there is no reason to book a parcel before its money is here.
+        if (perParcel is not null) pending = [.. pending.Where(p => perParcel.ContainsKey(p.Waybill))];
 
         if (pending.Count == 0) return (0, skipped, 0);
 
-        var byWaybill = await erp.ByWaybillAsync([.. pending.Select(p => p.Waybill)], cancellationToken);
+        // Hellmann's file carries no waybill, only the invoice number somebody typed in, so there
+        // is nothing to look up in the shipment tables and the number is followed straight to the
+        // document - forgivingly, because it is typed by hand.
+        var byWaybill = perParcel is not null
+            ? new Dictionary<string, List<CodDocument>>(StringComparer.OrdinalIgnoreCase)
+            : await erp.ByWaybillAsync([.. pending.Select(p => p.Waybill)], cancellationToken);
 
         // Only for the parcels shipping has no record of - a cancelled and resent shipment loses
         // its link, and then the number printed on the report is all there is.
@@ -385,8 +496,11 @@ public sealed class CodPipeline(
 
         var byNumber = unresolved.Count == 0
             ? new Dictionary<string, List<CodDocument>>(StringComparer.OrdinalIgnoreCase)
-            : await erp.ByDocumentNumberAsync(
-                [.. unresolved.SelectMany(p => p.DocumentNumbers)], cancellationToken);
+            : perParcel is not null
+                ? await erp.ByPrintedNumberLooselyAsync(
+                    [.. unresolved.SelectMany(p => p.DocumentNumbers)], cancellationToken)
+                : await erp.ByDocumentNumberAsync(
+                    [.. unresolved.SelectMany(p => p.DocumentNumbers)], cancellationToken);
 
         var proposed = 0;
         var withoutDocuments = 0;
@@ -394,6 +508,18 @@ public sealed class CodPipeline(
         foreach (var parcel in pending)
         {
             var documents = Documents(parcel, byWaybill, byNumber, out var source);
+
+            // With several documents sharing an ordinal across series, the amount says which one is
+            // meant - and it is the same amount the transfer was worth, so nothing is guessed.
+            if (perParcel is not null && documents.Count > 1)
+            {
+                var onAmount = documents
+                    .Where(d => Math.Abs(d.Remaining - parcel.Amount) <= 0.004m)
+                    .ToList();
+
+                if (onAmount.Count == 1) documents = onAmount;
+            }
+
             if (documents.Count == 0) withoutDocuments++;
 
             // Penny for penny, or not at all. A parcel worth less than the invoice it points at
@@ -402,11 +528,13 @@ public sealed class CodPipeline(
             var outstanding = documents.Sum(d => d.Remaining);
             var exact = documents.Count > 0 && Math.Abs(outstanding - parcel.Amount) <= 0.004m;
 
+            var payout = perParcel is not null ? perParcel[parcel.Waybill] : null;
+
             var entry = new CodEntry(
                 StableId(courier, parcel.Waybill),
                 _options.Register,
                 courier,
-                bookedOn,
+                payout?.BookedOn ?? bookedOn,
                 parcel.Waybill,
                 parcel.Amount,
                 parcel.Recipient,
@@ -415,7 +543,8 @@ public sealed class CodPipeline(
                 settleable && exact ? "High" : "None",
                 Note(parcel, documents, source, outstanding, exact, settleable),
                 path,
-                documents);
+                documents,
+                payout?.EntryId ?? 0);
 
             if (await store.SaveEntryAsync(entry, runId, cancellationToken)) proposed++;
         }
@@ -501,6 +630,24 @@ public sealed class CodPipeline(
                 "Transfer {Entry} from {Courier} flagged as not subject to settlement - all {Count} " +
                 "of its parcels are settled in {Register}.",
                 row.PayoutEntryId, row.Courier, row.ParcelCount, _options.Register);
+        }
+
+        // The couriers that pay parcel by parcel: there the transfer to set aside belongs to the
+        // parcel, not to the report, so it is the settled parcels that name it.
+        foreach (var (entryId, courier, file) in await store.GetSettledParcelPayoutsAsync(cancellationToken))
+        {
+            var description =
+                $"Rozpisane na paczki w {_options.Register} wg zestawienia "
+                + $"{Path.GetFileNameWithoutExtension(file)}";
+
+            if (!await store.CloseCodPayoutAsync(entryId, description, cancellationToken)) continue;
+
+            closed++;
+
+            logger.LogInformation(
+                "Transfer {Entry} from a {Source} parcel flagged as not subject to settlement - " +
+                "its parcel is settled in {Register}.",
+                entryId, courier, _options.Register);
         }
 
         return closed;

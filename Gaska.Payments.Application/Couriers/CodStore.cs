@@ -1,4 +1,4 @@
-using Gaska.Payments.Application.Settlement;
+﻿using Gaska.Payments.Application.Settlement;
 using Gaska.Payments.Domain.Model;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
@@ -28,7 +28,12 @@ public sealed record CodEntry(
     string Confidence,
     string Notes,
     string SourceFile,
-    IReadOnlyList<CodDocument> Documents);
+    IReadOnlyList<CodDocument> Documents,
+    /// <summary>
+    /// The courier transfer that paid this one parcel, or 0 when the whole report was paid by one
+    /// transfer. Only Hellmann pays parcel by parcel.
+    /// </summary>
+    int PayoutEntryId = 0);
 
 /// <summary>
 /// Writes the cash on delivery parcels into the service's own tables, and remembers which
@@ -266,6 +271,44 @@ public sealed class CodStore(IOptions<ErpOptions> options)
     /// an entry that is still untouched (<c>KAZ_Rozliczony = 0</c>) is changed.
     /// </remarks>
     /// <returns>True when the entry was actually changed.</returns>
+    /// <summary>
+    /// The courier transfers that paid one parcel each and whose parcel is now settled.
+    /// </summary>
+    /// <remarks>
+    /// The counterpart of <see cref="GetFullySettledAsync"/> for Hellmann, where a transfer answers
+    /// for a single parcel rather than for a whole report. Transfers already set aside are left
+    /// out, so a pass that has nothing new to do writes nothing.
+    /// </remarks>
+    public async Task<IReadOnlyList<(int PayoutEntryId, string Courier, string SourceFile)>>
+        GetSettledParcelPayoutsAsync(CancellationToken cancellationToken = default)
+    {
+        const string sql = """
+            SELECT p.CodPayoutEntryId, MIN(ISNULL(rep.Courier, p.ContractorSource)), MIN(p.SourceFile)
+            FROM pay.Payment AS p
+            INNER JOIN CDN.Zapisy AS z ON z.KAZ_GIDNumer = p.CodPayoutEntryId
+            LEFT JOIN pay.CourierReport AS rep ON rep.FilePath = p.SourceFile
+            WHERE p.PostingCategory = 'Cod'
+              AND p.CodPayoutEntryId IS NOT NULL
+              AND z.KAZ_Rozliczony = 0
+            GROUP BY p.CodPayoutEntryId
+            HAVING SUM(CASE WHEN p.SettledAt IS NULL THEN 1 ELSE 0 END) = 0
+            """;
+
+        var found = new List<(int, string, string)>();
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = new SqlCommand(sql, connection) { CommandTimeout = 60 };
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            found.Add((reader.GetInt32(0), reader.GetString(1), reader.GetString(2)));
+        }
+
+        return found;
+    }
+
     public async Task<bool> CloseCodPayoutAsync(
         int entryId, string description, CancellationToken cancellationToken = default)
     {
@@ -353,19 +396,20 @@ public sealed class CodStore(IOptions<ErpOptions> options)
                 ContractorId = @contractorId, ContractorSource = @contractorSource,
                 Confidence = @confidence, Notes = @notes, SourceFile = @sourceFile,
                 AllocatedAmount = @allocated, UnallocatedAmount = @unallocated,
+                CodPayoutEntryId = @payoutEntryId,
                 LastUpdatedAt = SYSDATETIME(), LastRunId = @runId
             WHEN NOT MATCHED THEN INSERT
                 (PaymentId, BankExternalId, CreditedAccount, BookingDate, Amount, Currency,
                  PayerName, PayerAccount, Description, ContractorId, ContractorSource,
                  ContractorFromBankAccount, Confidence, Strategy, AllocatedAmount, UnallocatedAmount,
                  Notes, Status, Direction, RegisterSeries, PostingCategory, SourceFile,
-                 FirstSeenAt, LastUpdatedAt, LastRunId)
+                 CodPayoutEntryId, FirstSeenAt, LastUpdatedAt, LastRunId)
             VALUES
                 (@paymentId, @waybill, '', @bookingDate, @amount, 'PLN',
                  @payerName, '', @description, @contractorId, @contractorSource,
                  1, @confidence, @strategy, @allocated, @unallocated,
                  @notes, 'Proposed', 'P', @register, @category, @sourceFile,
-                 SYSDATETIME(), SYSDATETIME(), @runId)
+                 @payoutEntryId, SYSDATETIME(), SYSDATETIME(), @runId)
             OUTPUT $action;
             """;
 
@@ -394,6 +438,8 @@ public sealed class CodStore(IOptions<ErpOptions> options)
             command.Parameters.AddWithValue("@category", PaymentCategory.Cod);
             command.Parameters.AddWithValue("@sourceFile", Cut(entry.SourceFile, 400));
             command.Parameters.AddWithValue("@runId", runId);
+            command.Parameters.AddWithValue(
+                "@payoutEntryId", entry.PayoutEntryId == 0 ? DBNull.Value : entry.PayoutEntryId);
 
             if (await command.ExecuteScalarAsync(cancellationToken) is not string action)
             {

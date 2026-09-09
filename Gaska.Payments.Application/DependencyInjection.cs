@@ -1,4 +1,4 @@
-using Gaska.Payments.Application.Couriers;
+﻿using Gaska.Payments.Application.Couriers;
 using Gaska.Payments.Application.Settlement;
 using Gaska.Payments.Domain.Couriers;
 using Gaska.Payments.Domain.Matching;
@@ -76,9 +76,10 @@ public static class DependencyInjection
         services.AddSingleton<BankSettlementPipeline>();
         services.AddSingleton<StatementArchive>();
 
-        // Cash on delivery: the mailbox, the readers of the three courier formats, and the
+        // Cash on delivery: the mailbox, the readers of the four courier formats, and the
         // pipeline that turns their reports into entries waiting to be posted.
         services.AddSingleton<ICodReportReader, GlsCsvReader>();
+        services.AddSingleton<ICodReportReader, HellmannXlsxReader>();
         services.AddSingleton<ICodReportReader, DpdXlsReader>();
         services.AddSingleton<ICodReportReader, FedexReportReader>();
         services.AddSingleton<CodMailbox>();

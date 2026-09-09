@@ -182,6 +182,13 @@ public static class PaymentSchema
         -- The order reference the bank returned. For transfers ordered from XL it ties the
         -- entry to one specific document payment, which is worth having to hand when explaining
         -- what happened.
+        -- The courier transfer that paid this parcel. Only Hellmann fills it in: the others send
+        -- one transfer for a whole report, and that one is recorded on the report's own row. Here
+        -- there is a transfer per parcel, so the transfer to set aside afterwards is a property of
+        -- the parcel and of nothing else.
+        IF COL_LENGTH('pay.Payment', 'CodPayoutEntryId') IS NULL
+            ALTER TABLE pay.Payment ADD CodPayoutEntryId INT NULL;
+
         IF COL_LENGTH('pay.Payment', 'EndToEndId') IS NULL
             ALTER TABLE pay.Payment ADD EndToEndId NVARCHAR(64) NULL;
 

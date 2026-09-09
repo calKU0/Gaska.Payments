@@ -1,4 +1,4 @@
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 using Gaska.Payments.Domain.Couriers;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
@@ -182,6 +182,130 @@ public sealed partial class ShipmentReader(IOptions<ErpOptions> options)
     /// The document ordinals hidden in the numbers we are looking for, or null when any of them
     /// does not carry one.
     /// </summary>
+    /// <summary>
+    /// The open items of documents named by number, forgiving of how the number was written.
+    /// </summary>
+    /// <remarks>
+    /// For Hellmann, whose file carries no waybill at all - there is nothing to join
+    /// <c>CDN.Wysylki</c> on, only the invoice number somebody typed into the spreadsheet, and it
+    /// is typed as people type: <c>FS-29914/26/S</c> for what ERP calls <c>FS-29914/26/SPR</c>,
+    /// and <c>FS-33936 /26/SPR</c> with a space that wandered in. Five of the sixty-three rows in
+    /// the first file were written one of those two ways, and matching the composed number exactly
+    /// found none of them.
+    ///
+    /// So the ordinal and the year decide, and everything else is returned alongside for the
+    /// caller to choose from - which it does on the amount, and the amount has to agree to the
+    /// penny. Two documents can share an ordinal across series (FS-211/26/DET and FS-21214/26/SPR
+    /// are different sequences), which is exactly why the choice is left to the caller rather than
+    /// made here.
+    ///
+    /// Keyed by the number as the file wrote it, so the caller can look up what it asked for.
+    /// </remarks>
+    public async Task<IReadOnlyDictionary<string, List<CodDocument>>> ByPrintedNumberLooselyAsync(
+        IReadOnlyCollection<string> numbers, CancellationToken cancellationToken = default)
+    {
+        var found = new Dictionary<string, List<CodDocument>>(StringComparer.OrdinalIgnoreCase);
+
+        var wanted = numbers
+            .Select(n => (Printed: n, Key: PrintedKey(n)))
+            .Where(x => x.Key is not null)
+            .ToList();
+
+        if (wanted.Count == 0) return found;
+
+        const string sql = """
+            SELECT n.TrN_TrNNumer, n.TrN_TrNRok, RTRIM(ISNULL(n.TrN_TrNSeria, '')) AS Seria,
+                   CDN.NumerDokumentu(n.TrN_GIDTyp, n.TrN_SpiTyp, n.TrN_TrNTyp,
+                                      n.TrN_TrNNumer, n.TrN_TrNRok, n.TrN_TrNSeria, 0) AS DocNumber,
+                   CAST(pl.TrP_GIDTyp AS INT), pl.TrP_GIDNumer, CAST(pl.TrP_GIDLp AS INT),
+                   pl.TrP_KntNumer, pl.TrP_Kwota, pl.TrP_Pozostaje, CAST(pl.TrP_Typ AS INT)
+            FROM CDN.TraNag AS n
+            INNER JOIN CDN.TraPlat AS pl
+                ON pl.TrP_GIDTyp = n.TrN_GIDTyp AND pl.TrP_GIDNumer = n.TrN_GIDNumer
+            WHERE pl.TrP_KntTyp = @contractorType
+              AND n.TrN_TrNNumer IN ({0})
+              AND n.TrN_TrNRok IN ({1})
+            """;
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        var ordinals = wanted.Select(x => x.Key!.Value.Ordinal).Distinct().ToList();
+        var years = wanted.Select(x => x.Key!.Value.Year).Distinct().ToList();
+
+        var candidates = new List<(int Ordinal, int Year, string Series, CodDocument Document)>();
+
+        foreach (var batch in ordinals.Chunk(BatchSize))
+        {
+            var command = new SqlCommand(
+                string.Format(sql, string.Join(", ", batch), string.Join(", ", years)),
+                connection) { CommandTimeout = 120 };
+
+            await using (command)
+            {
+                command.Parameters.AddWithValue("@contractorType", ContractorGidType);
+
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    candidates.Add((
+                        Convert.ToInt32(reader.GetValue(0)),
+                        Convert.ToInt32(reader.GetValue(1)),
+                        reader.GetString(2),
+                        new CodDocument(
+                            reader.GetInt32(4), reader.GetInt32(5), reader.GetInt32(6),
+                            reader.GetString(3).Trim(), reader.GetInt32(7),
+                            reader.GetDecimal(8), reader.GetDecimal(9), reader.GetInt32(10))));
+                }
+            }
+        }
+
+        foreach (var (printed, key) in wanted)
+        {
+            var (ordinal, year, series) = key!.Value;
+
+            var mine = candidates
+                .Where(c => c.Ordinal == ordinal && c.Year == year)
+                // The series as written first, then one it is the beginning of ("S" for "SPR"),
+                // then whatever else shares the ordinal - the caller decides on the amount.
+                .OrderByDescending(c => string.Equals(c.Series, series, StringComparison.OrdinalIgnoreCase))
+                .ThenByDescending(c => series.Length > 0
+                    && c.Series.StartsWith(series, StringComparison.OrdinalIgnoreCase))
+                .Select(c => c.Document)
+                .ToList();
+
+            if (mine.Count > 0) found[printed] = mine;
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// The ordinal, year and series out of a number as the file spells it, or null when it is not
+    /// a document number at all.
+    /// </summary>
+    /// <remarks>
+    /// The year is written with two digits in the file and with four in ERP, so "26" becomes 2026.
+    /// Spaces are dropped first - one of the numbers came through as "FS-33936 /26/SPR".
+    /// </remarks>
+    private static (int Ordinal, int Year, string Series)? PrintedKey(string printed)
+    {
+        var text = new string([.. printed.Where(c => !char.IsWhiteSpace(c))]).ToUpperInvariant();
+
+        var match = PrintedNumber().Match(text);
+        if (!match.Success) return null;
+
+        if (!int.TryParse(match.Groups["num"].Value, out var ordinal)) return null;
+        if (!int.TryParse(match.Groups["yr"].Value, out var year)) return null;
+
+        return (ordinal, year < 100 ? 2000 + year : year, match.Groups["ser"].Value);
+    }
+
+    /// <summary>FS-<b>29914</b>/<b>26</b>/<b>SPR</b>, series optional.</summary>
+    [GeneratedRegex(@"-(?<num>\d+)/(?<yr>\d{2,4})(?:/(?<ser>[A-Z]*))?")]
+    private static partial Regex PrintedNumber();
+
     private static IReadOnlyList<int>? Prefilter(IReadOnlyCollection<string> numbers)
     {
         var ordinals = new List<int>(numbers.Count);

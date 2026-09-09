@@ -1,4 +1,4 @@
-namespace Gaska.Payments.Domain.Couriers;
+﻿namespace Gaska.Payments.Domain.Couriers;
 
 /// <summary>One courier payout report: a collective transfer broken down into parcels.</summary>
 /// <param name="Format">Which reader produced this - <c>GlsCsv</c>, <c>DpdXls</c>, <c>FedexReport</c>.</param>
@@ -29,6 +29,21 @@ public sealed record CodReport(
 
     /// <summary>Whether the parcels add up to the payout the courier declares.</summary>
     public bool AddsUp => Math.Abs(ParcelTotal - PayoutTotal) <= 0.004m;
+
+    /// <summary>
+    /// Whether the courier pays each parcel with a transfer of its own.
+    /// </summary>
+    /// <remarks>
+    /// True only for Hellmann. The others send one transfer covering the whole file, which is what
+    /// lets the sum be checked against it: parcels that do not add up to the money received mean
+    /// the file was read wrongly, and nothing from it is settled.
+    ///
+    /// Hellmann gives no such check - there is no collective transfer and no total in the file - so
+    /// each parcel is paired with its own transfer instead, by the order number the title carries,
+    /// and the amounts are compared one to one. That is a stronger check per parcel than the
+    /// collective one, not a weaker one: the transfer has to be worth exactly what the row says.
+    /// </remarks>
+    public bool PaysPerParcel { get; init; }
 }
 
 /// <summary>
