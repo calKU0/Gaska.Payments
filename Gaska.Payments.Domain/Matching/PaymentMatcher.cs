@@ -1,4 +1,4 @@
-using Gaska.Payments.Domain.Model;
+﻿using Gaska.Payments.Domain.Model;
 using Gaska.Payments.Domain.Parsing;
 
 namespace Gaska.Payments.Domain.Matching;
@@ -94,6 +94,12 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
 
         var namedButNotOpen = explicitHits.Count == 0 && namedDocuments.Count > 0;
 
+        // Whether the title pointed at any document at all, year or no year. Wider than the
+        // condition above on purpose: a title listing eleven bare invoice numbers says just as
+        // plainly what it is for, and if none of them is open any more the answer is "a human has
+        // to look at this", not a set of somebody else's invoices that happens to add up.
+        var titleNamedDocuments = parsed.References.Count > 0;
+
         if (namedButNotOpen)
         {
             notes.Add($"W tytule wskazano {string.Join(", ", namedDocuments.Take(5))}, ale wśród " +
@@ -101,7 +107,8 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
                       "prawdopodobnie został już rozliczony albo numer jest błędny.");
         }
 
-        var result = Allocate(payment, index, contractorId, explicitHits, namedButNotOpen, notes);
+        var result = Allocate(
+            payment, index, contractorId, explicitHits, namedButNotOpen, titleNamedDocuments, notes);
         DescribeOutcome(result, payment.IsIncoming, notes);
 
         var confidence = ApplyBankAccountRequirement(result.Confidence, contractor.FromBankAccount, notes);
@@ -424,6 +431,7 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
         int contractorId,
         List<ReferenceHit> explicitHits,
         bool namedButNotOpen,
+        bool titleNamedDocuments,
         List<string> notes)
     {
         var target = payment.AmountToAllocate;
@@ -444,7 +452,8 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
         if (contractorId != 0)
         {
             var outcome = AllocateFromContractorPool(
-                payment, index, contractorId, explicitHits, target, tolerance, namedButNotOpen, notes);
+                payment, index, contractorId, explicitHits, target, tolerance, namedButNotOpen,
+                titleNamedDocuments, notes);
             if (outcome is not null) return outcome;
         }
 
@@ -664,6 +673,7 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
         decimal target,
         decimal tolerance,
         bool namedButNotOpen,
+        bool titleNamedDocuments,
         List<string> notes)
     {
         if (explicitHits.Count > 0) return null;
@@ -671,25 +681,48 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
         var pool = BuildPool(index, contractorId, payment.Currency);
         if (pool.Count == 0) return null;
 
-        var subset = SelectSubset(pool, target, tolerance, out var solutionCount);
+        var candidates = SolveSubsets(pool, target, tolerance);
 
-        // Matching on the amount alone makes sense only when the answer is unambiguous. When
-        // several different sets of invoices give the same amount, naming any one of them is a
-        // coin toss (18% accuracy on historical data) and only misleads the operator.
-        if (subset is not null && solutionCount > 1)
+        // Several sets fitting the amount is only usable evidence when the title offered nothing
+        // to go on. If the customer wrote out document numbers and none of them is open any more,
+        // proposing an unrelated set that adds up is worse than proposing nothing - the operator
+        // would be accepting a coincidence.
+        if (candidates.Count > 1 && titleNamedDocuments)
         {
-            notes.Add($"Kwota {KindOf(payment.IsIncoming)} pasuje do {solutionCount} różnych zestawów " +
-                      $"{SideOf(payment.IsIncoming)} tego kontrahenta – bez wskazówki w tytule nie da się " +
-                      "rozstrzygnąć, o który chodzi.");
+            notes.Add($"Kwota {KindOf(payment.IsIncoming)} pasuje do {candidates.Count} różnych zestawów " +
+                      $"{SideOf(payment.IsIncoming)} tego kontrahenta, ale w tytule wskazano konkretne " +
+                      "dokumenty – nie podstawiam innych.");
             return null;
         }
 
-        if (subset is not null)
+        if (candidates.Count > 0)
         {
+            var ambiguous = candidates.Count > 1;
+
+            // Several sets of invoices can come to the same figure, and the title says nothing
+            // about which. Rather than leave the payment with no proposal at all, the oldest debt
+            // is settled first - the order receivables are cleared in anyway - and the operator is
+            // told plainly that this was a choice. Nothing here settles by itself: only High does
+            // that, and this never gets above Medium.
+            var subset = ambiguous
+                ? candidates.Order(Comparer<List<OpenReceivable>>.Create(CompareByAge)).First()
+                : candidates[0];
+
+            var reason = ambiguous
+                ? $"najstarszy z {candidates.Count} zestawów {SideOf(payment.IsIncoming)} o tej kwocie"
+                : $"kwota {KindOf(payment.IsIncoming)} odpowiada sumie {SideOf(payment.IsIncoming)} kontrahenta";
+
             var allocations = subset
-                .Select(r => new MatchAllocation(r, r.SignedRemaining, 0.65,
-                    $"kwota {KindOf(payment.IsIncoming)} odpowiada sumie {SideOf(payment.IsIncoming)} kontrahenta"))
+                .Select(r => new MatchAllocation(r, r.SignedRemaining, ambiguous ? 0.50 : 0.65, reason))
                 .ToList();
+
+            if (ambiguous)
+            {
+                notes.Add($"Kwota {KindOf(payment.IsIncoming)} pasuje do {candidates.Count} różnych zestawów " +
+                          $"{SideOf(payment.IsIncoming)} tego kontrahenta, a tytuł nie wskazuje żadnego – " +
+                          $"proponuję najstarszy zestaw (od {subset.Min(r => r.DueDate):dd.MM.yyyy}). " +
+                          "Sprawdź, czy to ten.");
+            }
 
             if (namedButNotOpen)
             {
@@ -743,8 +776,23 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
     private List<OpenReceivable>? SelectSubset(
         IReadOnlyList<OpenReceivable> pool, decimal target, decimal tolerance, out int solutionCount)
     {
-        solutionCount = 0;
-        if (pool.Count == 0) return null;
+        var all = SolveSubsets(pool, target, tolerance);
+        solutionCount = all.Count;
+        return all.Count == 0 ? null : all[0];
+    }
+
+    /// <summary>
+    /// Every set of open items that adds up to the amount, the most likely first.
+    /// </summary>
+    /// <remarks>
+    /// Ordered by fewest documents, then by the oldest one among them. Fewest first because a
+    /// customer paying six invoices with one transfer is ordinary and paying nineteen that happen
+    /// to add up to the same figure is not.
+    /// </remarks>
+    private List<List<OpenReceivable>> SolveSubsets(
+        IReadOnlyList<OpenReceivable> pool, decimal target, decimal tolerance)
+    {
+        if (pool.Count == 0) return [];
 
         var values = pool.Select(r => SubsetSumSolver.ToCents(r.SignedRemaining)).ToList();
         var solutions = SubsetSumSolver.Solve(
@@ -753,9 +801,7 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
             _options.MaxDocumentsPerPayment,
             SubsetSumSolver.ToCents(tolerance));
 
-        if (solutions.Count == 0) return null;
-
-        var ranked = solutions
+        return [.. solutions
             .Select(s => new
             {
                 Solution = s,
@@ -764,10 +810,30 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
             .OrderBy(x => x.Items.Count)
             .ThenBy(x => x.Items.Min(r => r.DueDate))
             .ThenBy(x => Math.Abs(x.Solution.Difference))
-            .ToList();
+            .Select(x => x.Items)];
+    }
 
-        solutionCount = ranked.Count;
-        return ranked[0].Items;
+    /// <summary>
+    /// Which of two sets settles the older debt.
+    /// </summary>
+    /// <remarks>
+    /// The due dates of each set are lined up oldest first and compared one by one: the set that
+    /// reaches further back wins, and when the oldest documents are of the same day the next ones
+    /// decide. That is what "pay the oldest off first" means when several sets come to the same
+    /// figure - not merely the earliest single invoice, which two sets can share.
+    /// </remarks>
+    private static int CompareByAge(List<OpenReceivable> left, List<OpenReceivable> right)
+    {
+        var byAge = left.Select(r => r.DueDate).Order().ToList();
+        var theirs = right.Select(r => r.DueDate).Order().ToList();
+
+        for (var i = 0; i < Math.Min(byAge.Count, theirs.Count); i++)
+        {
+            var order = byAge[i].CompareTo(theirs[i]);
+            if (order != 0) return order;
+        }
+
+        return byAge.Count.CompareTo(theirs.Count);
     }
 
     /// <summary>Greedy spreading: from the oldest open item until the amount runs out.</summary>

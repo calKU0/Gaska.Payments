@@ -145,11 +145,15 @@ public sealed class ErpPostingService(
     /// Says out loud what can no longer be posted.
     /// </summary>
     /// <remarks>
-    /// An operation whose register has moved on to a later day cannot be posted at all - ERP will
-    /// only take an entry into the newest report. It is left out of the posting query so it stops
-    /// costing an API call every hour, which means nothing else would ever mention it again. This
-    /// is that mention: money that reached the bank and has not reached ERP, and that somebody has
-    /// to enter by hand.
+    /// An operation whose day never got a report, on a register that has since moved on to a later
+    /// one, cannot be posted at all: the entry needs a report of its own day and no report can be
+    /// opened in the past (<c>XLDodajRaport</c> answers 8181). It is left out of the posting query
+    /// so it stops costing an API call every hour, which means nothing else would ever mention it
+    /// again. This is that mention: money that reached the bank and has not reached ERP, and that
+    /// somebody has to enter by hand.
+    ///
+    /// A later report on its own strands nothing - an entry goes into its own day's open report
+    /// whether or not newer ones exist. See <c>PostingRepository.PastDay</c> for the measurements.
     /// </remarks>
     private async Task ReportStrandedAsync(CancellationToken cancellationToken)
     {
@@ -157,9 +161,9 @@ public sealed class ErpPostingService(
         if (stranded.Count == 0) return;
 
         logger.LogWarning(
-            "{Count} operations worth {Amount:N2} cannot be posted: their register already has a " +
-            "report from a later day, and ERP takes entries only into the newest one. They have to " +
-            "be entered by hand. Days affected: {Days}",
+            "{Count} operations worth {Amount:N2} cannot be posted: their day has no open report " +
+            "and their register has already moved on, so no report can be opened for it any more. " +
+            "They have to be entered by hand. Days affected: {Days}",
             stranded.Sum(s => s.Count), stranded.Sum(s => s.Amount),
             string.Join(", ", stranded.Select(s => $"{s.Register} {s.Day:yyyy-MM-dd} ({s.Count})")));
     }
@@ -196,9 +200,9 @@ public sealed class ErpPostingService(
 
         // Operations arrive ordered by day, and each day's report is created only when its first
         // entry is about to be posted. Creating them all up front - which is what this did - shuts
-        // the door on the earlier days: ERP refuses an entry whose day is not the register's newest
-        // report, so on 2026-09-02 the report for that day was created first and the 112 operations
-        // of 2026-09-01 that the bank had just delivered bounced off it.
+        // the door on the earlier days: a report cannot be opened in the past, so on 2026-09-02 the
+        // report for that day was created first and the 112 operations of 2026-09-01 that the bank
+        // had just delivered were left with no report of their own to go into.
         foreach (var operation in operations)
         {
             reportsCreated += EnsureReport(session, operation, existingReports);
@@ -296,9 +300,9 @@ public sealed class ErpPostingService(
     /// </summary>
     /// <remarks>
     /// Called for every operation, immediately before its entry is posted, so that the reports come
-    /// into being in the same order as the entries - oldest first. ERP will not add an entry to a
-    /// report that is not the register's newest, so a report created ahead of its turn strands
-    /// every operation of the days before it.
+    /// into being in the same order as the entries - oldest first. A report cannot be opened for a
+    /// day the register has already passed, so one created ahead of its turn leaves every earlier
+    /// day that had no report of its own with no way of ever getting one.
     ///
     /// In buffer mode there is nothing to create: an entry in the buffer hangs off the register
     /// rather than off a report (<c>KAZ_KRPTyp = 752</c>), and only on confirmation does ERP pull
@@ -321,6 +325,9 @@ public sealed class ErpPostingService(
             DataOtw = XlDate.FromDateTime(day),
         };
 
+        // The id the API hands back is its own handle on the new report, not KRP_GIDNumer, and it
+        // is not needed: AddCashEntry passes 0 and lets XL find the report from the register and
+        // the entry's date. Passing a report's GID there is what earns an 8158.
         var reportId = 0;
         var result = cdn_api.cdn_api.XLDodajRaport(session.Id, ref reportId, report);
 
@@ -328,7 +335,8 @@ public sealed class ErpPostingService(
         {
             // 8181 means a report with a later opening date already exists. ERP requires reports to
             // be created in chronological order, so a day in the past cannot be filled in - but the
-            // rest of the pass is to carry on regardless.
+            // rest of the pass is to carry on regardless. Operations in that position are filtered
+            // out before the pass begins, so an 8181 here means a report appeared while it ran.
             logger.LogError("XLDodajRaport returned {Result} for register {Series} and day {Day:yyyy-MM-dd}.",
                 result, operation.RegisterSeries, day);
             return 0;

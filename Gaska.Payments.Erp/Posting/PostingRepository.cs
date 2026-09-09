@@ -241,24 +241,47 @@ public sealed class PostingRepository(string connectionString)
         """;
 
     /// <summary>
-    /// Whether the register has a report from a later day than the operation - which is what makes
-    /// the operation impossible to post.
+    /// Whether the operation's day has moved out of reach: the register has gone on to a later day
+    /// and this one has no open report of its own to take the entry.
     /// </summary>
     /// <remarks>
-    /// ERP refuses an entry whose day is not the register's newest report (<c>XLDodajZapis</c>
-    /// answers 8158), and a day once passed never comes back. Such an operation would fail on every
-    /// pass for ever - a wasted API call each time and a line in the error log that hides the real
-    /// problems - so it is kept out of the posting query altogether and reported separately.
+    /// What ERP actually refuses, measured against TESTOWA rather than assumed:
     ///
-    /// It does not apply in buffer mode: an entry in the buffer hangs off the register rather than
-    /// off a report, and the day does not come into it.
+    /// <list type="bullet">
+    /// <item><c>XLDodajRaport</c> answers 8181 for a day earlier than the register's newest report:
+    /// a report once passed cannot be opened after the fact, and that much is final.</item>
+    /// <item><c>XLDodajZapis</c> called with report id 0 - which is how this service calls it -
+    /// finds the report itself from the register and the entry's date. An entry dated 2026-09-08
+    /// on FORPL went into that day's report while the register's newest was 2026-09-09, so a
+    /// later report does NOT close an earlier day. It answers 8158 - "no report of that id" -
+    /// when the day it is given has no report at all.</item>
+    /// </list>
+    ///
+    /// So the operations beyond help are only those whose own day has no open report and whose
+    /// register has already moved past it: nothing can create that report any more. An operation
+    /// whose day still holds an open report is left in - it posts.
+    ///
+    /// Closed reports count as no report. Whether ERP would take an entry into one is untested and
+    /// deliberately so: an automat writing into a closed period is not wanted either way.
+    ///
+    /// None of this applies in buffer mode: an entry in the buffer hangs off the register rather
+    /// than off a report, and the day does not come into it.
     /// </remarks>
     private const string PastDay = """
-        EXISTS (
-            SELECT 1
-            FROM CDN.Raporty AS newer
-            WHERE RTRIM(newer.KRP_Seria) = p.RegisterSeries
-              AND newer.KRP_DataOtwarcia > DATEDIFF(DAY, '1800-12-28', p.BookingDate)
+        (
+            EXISTS (
+                SELECT 1
+                FROM CDN.Raporty AS newer
+                WHERE RTRIM(newer.KRP_Seria) = p.RegisterSeries
+                  AND newer.KRP_DataOtwarcia > DATEDIFF(DAY, '1800-12-28', p.BookingDate)
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM CDN.Raporty AS own
+                WHERE RTRIM(own.KRP_Seria) = p.RegisterSeries
+                  AND own.KRP_DataOtwarcia = DATEDIFF(DAY, '1800-12-28', p.BookingDate)
+                  AND ISNULL(own.KRP_DataZamkniecia, 0) = 0
+            )
         )
         """;
 

@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text.RegularExpressions;
 using Gaska.Payments.Domain.Model;
 
@@ -88,6 +88,12 @@ public sealed partial class DescriptionParser
         var references = new List<DocumentReference>();
         references.AddRange(Extract(compact, requireYearForTypedReferences: false));
         references.AddRange(Extract(spaced, requireYearForTypedReferences: true));
+
+        // Runs are read off the glued form only. With the spaces still in, a number the 35-character
+        // wrapping cut in half - "4062 7/26/SPR" - ends a run early and its first half gets treated
+        // as a shortened continuation. On the live register that invented one wrong number in each
+        // of nine titles and not one of them existed; glued, the same nine produce nothing at all.
+        references.AddRange(ExtractAbbreviatedRuns(compact));
 
         return new ParsedDescription
         {
@@ -348,6 +354,77 @@ public sealed partial class DescriptionParser
         }
     }
 
+    /// <summary>
+    /// Numbers a customer wrote as a continuation of the one before, giving only the digits that
+    /// changed: <c>39653,665,659</c> meaning 39653, 39665, 39659.
+    /// </summary>
+    /// <remarks>
+    /// A common way of listing a long run of consecutive invoices by hand, and the reason a JSAGRO
+    /// payment of 13 773,09 was matched only to its first three documents (9 396,11): the eight
+    /// shortened numbers meant nothing on their own. Expanded, all eleven are open items of that
+    /// contractor and come to 13 773,09 to the grosz. The same title style covered a second payment
+    /// of 14 325,39 across twenty-eight documents, corrections included.
+    ///
+    /// The rule is the one a person reads: a token shorter than the number it follows replaces that
+    /// number's last digits. The basis stays put while shorter tokens follow it, so
+    /// <c>40005,155,198</c> is 40005, 40155, 40198, and a token as long as the basis becomes the new
+    /// basis. A run ends at anything that is not a digit or a separator - which is what makes
+    /// "minus" start the corrections over ("40718, minus 3083, 81" is 40718, then 3083 and 3081).
+    ///
+    /// The shortened token is left in place for <see cref="ExtractBareNumbers"/> to read literally
+    /// as well: nothing is masked here, so this only ever adds a candidate. If both readings turn
+    /// out to be open documents the sums stop adding up and the payment lands in front of an
+    /// accountant, exactly where it lands today.
+    /// </remarks>
+    /// <summary>How many numbers a comma-separated run needs before it is read as a list.</summary>
+    private const int MinimumRunLength = 3;
+
+    /// <summary>The shortest run of digits this parser will take for a document number anywhere.</summary>
+    private const int MinimumNumberDigits = 3;
+
+    private IEnumerable<DocumentReference> ExtractAbbreviatedRuns(string text)
+    {
+        foreach (Match run in NumberRunRegex().Matches(text))
+        {
+            var tokens = run.Value.Split([',', ';', ' '], StringSplitOptions.RemoveEmptyEntries);
+
+            // Three is the shortest run that is unmistakably a list. Two numbers with a comma
+            // between them are what an amount looks like - "1234,56" - and reading those as a
+            // list of documents would invent references out of every price in a title.
+            if (tokens.Length < MinimumRunLength) continue;
+
+            var basis = tokens[0];
+
+            foreach (var token in tokens)
+            {
+                if (token.Length >= basis.Length)
+                {
+                    basis = token;
+
+                    // The full numbers of the run are given again on purpose. The first two
+                    // members look exactly like an amount - "3083,81" is 3 083,81 zł - so the
+                    // amount mask had already eaten the 3083 that opens the corrections in a
+                    // JSAGRO title, and with it 35,42 zł of the payment. Inside a run of three or
+                    // more the list reading is the right one.
+                    if (token.Length < MinimumNumberDigits) continue;
+
+                    var whole = MakeReference(
+                        DocumentKind.Unknown, token, null, null, ReferenceStrength.BareNumber, token);
+
+                    if (whole is not null) yield return whole;
+                    continue;
+                }
+
+                var expanded = string.Concat(basis.AsSpan(0, basis.Length - token.Length), token);
+                var reference = MakeReference(
+                    DocumentKind.Unknown, expanded, null, null,
+                    ReferenceStrength.ListContinuation, $"{basis}...{token}");
+
+                if (reference is not null) yield return reference;
+            }
+        }
+    }
+
     private IEnumerable<DocumentReference> ExtractBareNumbers(string compact, bool[] consumed)
     {
         foreach (Match match in BareNumberRegex().Matches(compact))
@@ -524,6 +601,18 @@ public sealed partial class DescriptionParser
     /// </remarks>
     [GeneratedRegex(@"(?<!\d)\d{3,12}(?!\d)", RegexOptions.CultureInvariant)]
     private static partial Regex BareNumberRegex();
+
+    /// <summary>
+    /// Numbers separated by commas and nothing else - the shape a hand-written list of invoices
+    /// takes. Letters end the run, which is how "minus" divides the invoices from the corrections.
+    ///
+    /// The run has to open with at least three digits, the same floor a bare number has to clear
+    /// elsewhere in this parser. Without it "f-ra nr 69,27,03,17,98,62,99" became seven references
+    /// two digits long, which is not a document number here but is a very good way to collide with
+    /// one.
+    /// </summary>
+    [GeneratedRegex(@"(?<!\d)\d{3,6}(?:\s*[,;]\s*\d{2,6})+(?!\d)", RegexOptions.CultureInvariant)]
+    private static partial Regex NumberRunRegex();
 
     [GeneratedRegex(@"(?:FVAT|FAKTURY|FAKTURA|FAKTURE|FAKT|FAK|FRA|FV|FA|F|INVOICE|INV|RACHUNEK|PRZELEW|DOTYCZY|DOT|SPLATA|ZAPLATA|PLATNOSC|NR|ZA)[.:#\-\ ]*$", RegexOptions.CultureInvariant)]
     private static partial Regex InvoiceKeywordRegex();
