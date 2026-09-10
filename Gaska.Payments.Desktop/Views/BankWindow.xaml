@@ -56,7 +56,7 @@
                 </Grid.ColumnDefinitions>
 
                 <StackPanel>
-                    <TextBlock Text="Kod banku z numeru" Style="{StaticResource Label}" />
+                    <TextBlock Text="Numer kierunkowy banku" Style="{StaticResource Label}" />
                     <TextBox x:Name="BankCodeBox" CharacterCasing="Upper" MaxLength="20"
                              VerticalContentAlignment="Center" />
                 </StackPanel>

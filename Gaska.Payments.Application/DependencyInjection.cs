@@ -80,6 +80,7 @@ public static class DependencyInjection
         // pipeline that turns their reports into entries waiting to be posted.
         services.AddSingleton<ICodReportReader, GlsCsvReader>();
         services.AddSingleton<ICodReportReader, HellmannXlsxReader>();
+        services.AddSingleton<ICodReportReader, DieraXlsxReader>();
         services.AddSingleton<ICodReportReader, DpdXlsReader>();
         services.AddSingleton<ICodReportReader, FedexReportReader>();
         services.AddSingleton<CodMailbox>();

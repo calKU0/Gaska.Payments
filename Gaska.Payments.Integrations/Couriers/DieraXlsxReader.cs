@@ -1,38 +1,41 @@
-﻿using ExcelDataReader;
+using ExcelDataReader;
 
 using Gaska.Payments.Domain.Couriers;
 
 namespace Gaska.Payments.Integrations.Couriers;
 
 /// <summary>
-/// The Hellmann report: one sheet, one header row, one line per parcel collected.
+/// The Diera report: one sheet, one header row, one line per parcel collected.
 /// </summary>
 /// <remarks>
-/// Unlike the others this is not a payout breakdown but a running list of parcels, and Hellmann
-/// pays each of them with a transfer of its own - the title of which is the order number from the
-/// first column. So the file states no payout total, no payment reference and no account, and the
-/// same rows come back in the next file: what has already been booked is what keeps them from
-/// being booked twice.
+/// Like Hellmann's, this is a running list rather than a payout breakdown - it is filled in as
+/// parcels are collected, states no total, no payment reference and no account, and the same rows
+/// come back in the next file. Unlike Hellmann's, Diera does not pay parcel by parcel: one transfer
+/// covers several of them and names them in its title, as "ZWROT POBRAN 2602153784,2602156427".
 ///
 /// The columns are:
 ///
 /// <code>
-/// Order NR | Order Customer NR | Data Utworzenia Zlecenia | Data Dostawy |
-/// Wartość Pobrania | Odbiorca Przesyłki | Miasto | Ulica
+/// Nr paczki/listu/zlecenia | Data pobrania | Kwota COD | Nr referencyjny |
+/// Data przelewu | Nazwa odbiorcy | Adres odbiorcy
 /// </code>
 ///
-/// There is no waybill number anywhere in it. The order number takes that place - it identifies
-/// the parcel, it is what the transfer's title carries, and it is what stops a row being booked a
-/// second time. The document is read from "Order Customer NR", which is our own invoice number
-/// written by hand and so of any capitalisation: FS-21214/26/SPR, fs-21764/26/spr, fs-38371/26/s.
+/// "Nr referencyjny" is our own invoice number, which is what the parcel is settled against. The
+/// parcel number is also a real waybill - it is <c>CDN.Wysylki.WYS_NumerObcy</c> with a "p01"
+/// suffix - but the file states the document outright, so the document is followed directly and
+/// shipping is left out of it, exactly as for Hellmann.
+///
+/// "Data przelewu" is meant to be filled in once Diera knows when it pays. Nothing here reads it:
+/// which parcels a transfer covers is decided by the transfer itself, and a column that is empty
+/// today would be one more thing to be wrong tomorrow.
 /// </remarks>
-public sealed class HellmannXlsxReader : ICodReportReader
+public sealed class DieraXlsxReader : ICodReportReader
 {
-    public const string FormatName = "HellmannXlsx";
+    public const string FormatName = "DieraXlsx";
 
-    private const int Order = 0;
-    private const int Document = 1;
-    private const int Money = 4;
+    private const int Parcel = 0;
+    private const int Money = 2;
+    private const int Document = 3;
     private const int Recipient = 5;
 
     /// <summary>The first bytes of a zip archive, which is what an .xlsx workbook is.</summary>
@@ -49,9 +52,9 @@ public sealed class HellmannXlsxReader : ICodReportReader
         {
             var header = Rows(content).FirstOrDefault() ?? [];
 
-            return header.Any(c => c.Contains("Order NR", StringComparison.OrdinalIgnoreCase))
-                && header.Any(c => c.Contains("Order Customer NR", StringComparison.OrdinalIgnoreCase))
-                && header.Any(c => c.Contains("Pobrania", StringComparison.OrdinalIgnoreCase));
+            return header.Any(c => c.Contains("Nr paczki", StringComparison.OrdinalIgnoreCase))
+                && header.Any(c => c.Contains("Kwota COD", StringComparison.OrdinalIgnoreCase))
+                && header.Any(c => c.Contains("Nr referencyjny", StringComparison.OrdinalIgnoreCase));
         }
         catch (Exception)
         {
@@ -66,17 +69,18 @@ public sealed class HellmannXlsxReader : ICodReportReader
 
         foreach (var row in Rows(content).Skip(1))
         {
-            var order = CodText.Clean(Cell(row, Order));
+            var parcel = CodText.Clean(Cell(row, Parcel));
             var amount = CodText.Amount(Cell(row, Money));
 
-            if (order.Length == 0 || amount == 0m) continue;
+            // The sheet comes with its empty rows already formatted, so most of what follows the
+            // last parcel is blank cells rather than the end of the file.
+            if (parcel.Length == 0 || amount == 0m) continue;
 
-            // The number is written by hand and comes in any capitalisation, so it is squared up
-            // here rather than at every place that compares it with ERP.
+            // Typed by hand and so of any capitalisation, like Hellmann's.
             var document = CodText.Clean(Cell(row, Document)).ToUpperInvariant();
 
             parcels.Add(new CodParcel(
-                order,
+                parcel,
                 amount,
                 document.Length == 0 ? [] : [document],
                 CodText.Clean(Cell(row, Recipient))));
@@ -84,19 +88,16 @@ public sealed class HellmannXlsxReader : ICodReportReader
 
         return new CodReport(
             FormatName,
-            // Today, because the file has no payout day to give: it is a running list of parcels,
-            // and each of them is paid whenever Hellmann gets round to it. Dating the report by
-            // the last delivery in it - the obvious thing - made the whole file look older than
-            // the takeover date and it was written off unread. Which parcels are old enough to
+            // Today, because the file has no payout day to give. Which parcels are old enough to
             // leave alone is decided per transfer instead, where the money actually is.
             DateTime.Today,
             parcels.Sum(p => p.Amount),
-            // No payment reference and no account: Hellmann states neither.
+            // No payment reference and no account: Diera states neither.
             string.Empty,
             string.Empty,
             parcels)
         {
-            Shape = CodPayoutShape.PerParcel,
+            Shape = CodPayoutShape.NamedGroups,
         };
     }
 

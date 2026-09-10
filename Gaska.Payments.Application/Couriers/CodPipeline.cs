@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 using Gaska.Payments.Domain.Couriers;
+using Gaska.Payments.Domain.Matching;
 using Gaska.Payments.Erp;
 using Gaska.Payments.Integrations.Couriers;
 
@@ -48,6 +49,20 @@ public sealed class CodPipeline(
     IOptions<ArchiveOptions> archiveOptions,
     ILogger<CodPipeline> logger)
 {
+    /// <summary>
+    /// How much of a parcel number has to be there before a transfer's title counts as naming it.
+    /// Waybills run to ten digits and more; anything shorter would be found in half the titles in
+    /// the bank.
+    /// </summary>
+    private const int MinimumParcelDigits = 6;
+
+    /// <summary>
+    /// How many parcels a transfer may be credited with beyond the ones its title names. A title
+    /// that got one number wrong is what this is for, not a title that named nothing much: the
+    /// wider the search, the likelier two different sets of parcels both fit the money.
+    /// </summary>
+    private const int MaximumParcelsMadeUp = 4;
+
     private readonly CodOptions _options = options.Value;
     private readonly SettlementOptions _settlement = settlementOptions.Value;
     private readonly ArchiveOptions _archive = archiveOptions.Value;
@@ -290,9 +305,15 @@ public sealed class CodPipeline(
             return summary with { Waiting = summary.Waiting + 1 };
         }
 
-        if (report.PaysPerParcel)
+        if (report.Shape == CodPayoutShape.PerParcel)
         {
             return await SettlePerParcelAsync(
+                row, report, payouts, posted, runId, summary, cancellationToken);
+        }
+
+        if (report.Shape == CodPayoutShape.NamedGroups)
+        {
+            return await SettleNamedGroupsAsync(
                 row, report, payouts, posted, runId, summary, cancellationToken);
         }
 
@@ -464,6 +485,139 @@ public sealed class CodPipeline(
             WithoutDocuments = summary.WithoutDocuments + counts.WithoutDocuments,
         };
     }
+
+    /// <summary>
+    /// A report whose parcels are paid in groups, each group named by the transfer that pays it.
+    /// </summary>
+    /// <remarks>
+    /// Diera only. Its file is a running list like Hellmann's - no total, no reference - but its
+    /// money arrives for several parcels at once, under a title that names them:
+    /// "ZWROT POBRAN 2602153784,2602156427" against 4 101,93, which is 1 940,33 and 2 161,60.
+    ///
+    /// So the transfer carries its own check and the file needs none: the parcels it pays for have
+    /// to add up to exactly what it is worth. Two payouts from the register were taken apart that
+    /// way before this was written, 4 101,93 and 5 397,56, and both came out to the grosz.
+    ///
+    /// The title is where a group starts but not where it ends. A number typed wrongly, or a title
+    /// the bank cut short, would otherwise leave the whole transfer unsettled for the sake of one
+    /// parcel, so what the title misses is looked for by amount instead - and taken only when
+    /// exactly one combination of the remaining parcels closes the difference.
+    ///
+    /// What the title must do is name at least one parcel of the file. The candidates are every
+    /// incoming transfer of a month on every register - some four thousand of them - and among that
+    /// many a sum can be met by coincidence. One named parcel is what says the money is Diera's.
+    /// </remarks>
+    private async Task<CodSummary> SettleNamedGroupsAsync(
+        CodReportRow row, CodReport report, IReadOnlyList<CodPayout> payouts, HashSet<string> posted,
+        int runId, CodSummary summary, CancellationToken cancellationToken)
+    {
+        var paid = new Dictionary<string, CodPayout>(StringComparer.OrdinalIgnoreCase);
+        var groups = 0;
+
+        foreach (var payout in payouts)
+        {
+            // The takeover date belongs to the transfer here, not to the file: the list reaches
+            // back over parcels that were settled by hand long ago.
+            if (payout.BookedOn.Date < _options.PostFrom.Date) continue;
+
+            var free = report.Parcels
+                .Where(p => !posted.Contains(p.Waybill) && !paid.ContainsKey(p.Waybill))
+                .ToList();
+
+            if (free.Count == 0) break;
+            if (GroupFor(payout, free) is not { } group) continue;
+
+            foreach (var parcel in group) paid[parcel.Waybill] = payout;
+            groups++;
+
+            logger.LogDebug(
+                "Transfer {Entry} of {Amount:N2} booked {Day:yyyy-MM-dd} pays {Count} parcels of the "
+                + "{Courier} report: {Parcels}.",
+                payout.EntryId, payout.Amount, payout.BookedOn, group.Count, row.Courier,
+                string.Join(", ", group.Select(p => p.Waybill)));
+        }
+
+        if (paid.Count == 0)
+        {
+            logger.LogDebug(
+                "No transfers yet for any of the {Count} parcels in the {Courier} report {File}.",
+                report.Parcels.Count, row.Courier, Path.GetFileName(row.FilePath));
+
+            return summary with { Waiting = summary.Waiting + 1 };
+        }
+
+        logger.LogInformation(
+            "The {Courier} report {File}: {Paid} of {Count} parcels are covered by {Groups} transfers, "
+            + "worth {Total:N2} together.",
+            row.Courier, Path.GetFileName(row.FilePath), paid.Count, report.Parcels.Count, groups,
+            paid.Values.Distinct().Sum(p => p.Amount));
+
+        // Dated by its own transfer, as in the per-parcel branch - see the note there on why the
+        // date passed here is the file's own.
+        var counts = await ProposeAsync(
+            report, row.Courier, row.FilePath, report.PayoutDate, settleable: true,
+            posted, runId, cancellationToken, paid);
+
+        var remaining = report.Parcels.Count(p => !posted.Contains(p.Waybill) && !paid.ContainsKey(p.Waybill));
+
+        await store.SaveAsync(row with
+        {
+            // The row stays open while any parcel could still be paid: this file is a list, and the
+            // next transfer against it may be weeks away.
+            Status = remaining == 0 ? CodReportStatus.Posted : CodReportStatus.Pending,
+            ParcelCount = report.Parcels.Count,
+            Note = $"{paid.Count} parcels paid by {groups} transfers, {remaining} still waiting",
+        }, cancellationToken);
+
+        return summary with
+        {
+            Posted = summary.Posted + (remaining == 0 ? 1 : 0),
+            Waiting = summary.Waiting + (remaining == 0 ? 0 : 1),
+            ParcelsProposed = summary.ParcelsProposed + counts.Proposed,
+            ParcelsSkipped = summary.ParcelsSkipped + counts.Skipped,
+            WithoutDocuments = summary.WithoutDocuments + counts.WithoutDocuments,
+        };
+    }
+
+    /// <summary>
+    /// The parcels one transfer pays for, or null when it pays for none of this file's.
+    /// </summary>
+    private static List<CodParcel>? GroupFor(CodPayout payout, IReadOnlyList<CodParcel> free)
+    {
+        var named = free
+            .Where(p => OnlyDigits(p.Waybill) is { Length: >= MinimumParcelDigits } digits
+                        && payout.Digits.Contains(digits, StringComparison.Ordinal))
+            .ToList();
+
+        // Nothing of ours is named, so the money is not ours to take - whatever it adds up to.
+        if (named.Count == 0) return null;
+
+        var missing = payout.Amount - named.Sum(p => p.Amount);
+
+        if (Math.Abs(missing) <= 0.004m) return named;
+
+        // The title names more than the transfer is worth. Which of them it really paid for is not
+        // something to guess at, so the transfer is left for somebody to look at.
+        if (missing < 0m) return null;
+
+        // The title fell short of the money. Whatever it left out has to be among the parcels still
+        // waiting, and it is taken only when one combination of them closes the gap exactly - two
+        // ways of making up the difference are two different answers, and neither is evidence.
+        var rest = free.Where(p => !named.Contains(p)).ToList();
+
+        var solutions = SubsetSumSolver.Solve(
+            [.. rest.Select(p => SubsetSumSolver.ToCents(p.Amount))],
+            SubsetSumSolver.ToCents(missing),
+            MaximumParcelsMadeUp,
+            tolerance: 0,
+            maxSolutions: 2);
+
+        if (solutions.Count != 1) return null;
+
+        return [.. named, .. solutions[0].Indices.Select(i => rest[i])];
+    }
+
+    private static string OnlyDigits(string value) => new([.. value.Where(char.IsAsciiDigit)]);
 
     private async Task<(int Proposed, int Skipped, int WithoutDocuments)> ProposeAsync(
         CodReport report, string courier, string path, DateTime bookedOn, bool settleable,
