@@ -72,8 +72,27 @@ public sealed record DocumentRow(
     /// <summary>
     /// <c>TrP_Rozliczona</c> as ERP holds it: 0 open, 1 settled, 2 the "nie rozliczaj" box.
     /// </summary>
-    int SettlementFlag)
+    int SettlementFlag,
+    /// <summary>The payment form as ERP spells it - "Przelew", "Za pobraniem", "Gotówka".</summary>
+    string PaymentForm,
+    /// <summary>The series of the register the payment is settled on, empty when it names none.</summary>
+    string Register)
 {
+    /// <summary>
+    /// Whether this is money a courier collects from the customer at the door.
+    /// </summary>
+    /// <remarks>
+    /// Decided by the register rather than by the payment form. The two nearly always agree -
+    /// 178 120 of the 178 161 payments on K_GLS say "Za pobraniem" - but the form on its own is
+    /// not the same question: a few hundred payments carry that form while sitting on FORPL or
+    /// KASPL, and those are settled by an ordinary transfer or over the counter, not by a courier.
+    /// </remarks>
+    public bool IsCashOnDelivery =>
+        Register.Equals(CashOnDeliveryRegister, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The register the couriers' money is paid onto.</summary>
+    public const string CashOnDeliveryRegister = "K_GLS";
+
     /// <summary>
     /// Whether the payment carries ERP's "nie rozliczaj" flag - the accountants' own decision
     /// that this open item is never going to be pursued.

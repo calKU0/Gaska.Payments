@@ -42,7 +42,9 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                    RTRIM(ISNULL(o.OB_Skrot, '')) AS Symbol,
                    COALESCE(NULLIF(RTRIM(n.TrN_DokumentObcy), ''),
                             NULLIF(RTRIM(imp.ImN_DokumentObcy), ''), '') AS DokumentObcy,
-                   pl.TrP_Rozliczona
+                   pl.TrP_Rozliczona,
+                   RTRIM(ISNULL(pl.TrP_FormaNazwa, '')) AS PaymentForm,
+                   RTRIM(ISNULL(rej.KAR_Seria, '')) AS Register
             FROM CDN.TraPlat AS pl
             LEFT JOIN CDN.TraNag AS n
                 ON n.TrN_GIDTyp = pl.TrP_GIDTyp AND n.TrN_GIDNumer = pl.TrP_GIDNumer
@@ -61,6 +63,10 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
             -- Customs documents have a header of their own - without it "SAD 21024" came out.
             LEFT JOIN CDN.SadNag AS sad
                 ON sad.SaN_GIDTyp = pl.TrP_GIDTyp AND sad.SaN_GIDNumer = pl.TrP_GIDNumer
+            -- The register the payment is settled on. It is what tells a cash on delivery from
+            -- everything else: the courier's money lands on K_GLS and nowhere else.
+            LEFT JOIN CDN.Rejestry AS rej
+                ON rej.KAR_GIDNumer = pl.TrP_KARNumer AND rej.KAR_GIDTyp = pl.TrP_KARTyp
             WHERE pl.TrP_GIDTyp NOT IN ({SettlementDocumentTypes.NotSettleableSql})
               -- Only contractor open items are settled. Tax returns hang on offices (4304)
               -- and payrolls on employees (944) - their party number can coincide with somebody's
@@ -384,7 +390,8 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                 Convert.ToInt32(reader.GetValue(4)), reader.GetDecimal(5), reader.GetDecimal(6),
                 reader.GetString(7).Trim(), XlDate.ToDateTime(reader.GetInt32(8)),
                 reader.GetInt32(9), reader.GetString(10), reader.GetString(11),
-                reader.GetString(12), Convert.ToInt32(reader.GetValue(13))));
+                reader.GetString(12), Convert.ToInt32(reader.GetValue(13)),
+                reader.GetString(14), reader.GetString(15)));
         }
 
         return rows;

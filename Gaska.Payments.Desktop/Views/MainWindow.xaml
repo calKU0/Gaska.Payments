@@ -672,6 +672,9 @@
                                                     ElementStyle="{StaticResource CellText}" />
                                 <DataGridTextColumn Header="Strona" Width="108" MinWidth="96" Binding="{Binding Kind}"
                                                     ElementStyle="{StaticResource CellText}" />
+                                <DataGridTextColumn Header="Forma" Width="118" MinWidth="96"
+                                                    Binding="{Binding PaymentForm}"
+                                                    ElementStyle="{StaticResource CellText}" />
                                 <DataGridTextColumn Header="Waluta" Width="78" MinWidth="72" Binding="{Binding Currency}"
                                                     ElementStyle="{StaticResource CellText}" />
                                 <DataGridTextColumn Width="120" MinWidth="110"

@@ -663,9 +663,18 @@ public sealed class CodPipeline(
         {
             var documents = Documents(parcel, byWaybill, byNumber, out var source);
 
-            // With several documents sharing an ordinal across series, the amount says which one is
-            // meant - and it is the same amount the transfer was worth, so nothing is guessed.
-            if (perParcel is not null && documents.Count > 1)
+            // Several documents on one parcel, and the parcel is worth exactly one of them: that
+            // one is what it pays for. Nothing is guessed here - a single candidate matching to the
+            // grosz is the same evidence the settlement itself is checked against, and where no
+            // single one matches, the list is left as it was and the check below refuses it.
+            //
+            // Two things put a parcel in that position. A document number can be shared across
+            // series, and then only the amount tells the two apart. And shipping can record two
+            // documents against one waybill while the courier sends a transfer for each: Fedex's
+            // parcel 6232312183698 of 379,16 pointed at FS-42169/26/SPR and FS-42170/26/SPR
+            // together, 1 656,39 of them, and went unsettled although one of the two was 379,16 to
+            // the grosz - its sibling parcel had already taken the other.
+            if (documents.Count > 1)
             {
                 var onAmount = documents
                     .Where(d => Math.Abs(d.Remaining - parcel.Amount) <= 0.004m)

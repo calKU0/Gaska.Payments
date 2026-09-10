@@ -77,6 +77,15 @@ public sealed class DocumentItem(
 
     public string Symbol => Row.Symbol;
 
+    /// <summary>
+    /// How the document is to be paid, in the words the accounting team uses. Documents settled on
+    /// the courier register say so plainly - those are the ones a courier's transfer closes, and
+    /// nothing else on the list is a cash on delivery however its payment form is spelt.
+    /// </summary>
+    public string PaymentForm => Row.IsCashOnDelivery ? "za pobraniem" : Row.PaymentForm.ToLowerInvariant();
+
+    public bool IsCashOnDelivery => Row.IsCashOnDelivery;
+
     /// <summary>The document number at the contractor's end - for liabilities, the supplier's invoice number.</summary>
     public string ForeignNumber => Row.ForeignNumber;
 
