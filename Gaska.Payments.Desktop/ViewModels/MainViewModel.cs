@@ -1090,7 +1090,7 @@ public sealed class MainViewModel : ObservableObject
 
         var documents = contractorId == 0
             ? []
-            : await _repository.GetOpenDocumentsAsync(contractorId);
+            : await _repository.GetOpenDocumentsAsync(contractorId, item.Row.Currency);
 
         Fill(item, documents);
     }

@@ -78,14 +78,50 @@ public sealed class DocumentIndex
         var haystack = TextNormalizer.NormalizeCompact(description);
         if (haystack.Length == 0 || _byForeignNumber.Count == 0) return [];
 
+        // The title with its spaces kept, alongside. See StandsAlone for why both are needed.
+        var spaced = TextNormalizer.Normalize(description);
+
         var hits = new List<OpenReceivable>();
 
         foreach (var (needle, items) in _byForeignNumber)
         {
-            if (haystack.Contains(needle, StringComparison.Ordinal)) hits.AddRange(items);
+            if (StandsAlone(haystack, needle) || StandsAlone(spaced, needle)) hits.AddRange(items);
         }
 
         return hits;
+    }
+
+    /// <summary>
+    /// Whether the number occurs in the title as itself rather than as the tail or head of a
+    /// longer one.
+    /// </summary>
+    /// <remarks>
+    /// Letters say nothing about where a number ends, because the title is compared with its
+    /// spaces taken out and words run into each other. Digits do: a digit next to a digit is the
+    /// same number carrying on. Marek Lach's invoice at his end is "9/2026", and a transfer to a
+    /// different supplier titled "Proforma PRO/377/09/2026" contained it - preceded by the 0 of
+    /// "09". That was enough to settle one supplier's payment against the other's invoice.
+    ///
+    /// It is asked of both forms of the title, and either will do. Without spaces, because the
+    /// bank breaks a title every 35 characters and a number comes back cut in two: "INV/9/20 26".
+    /// With spaces, because taking them out also glues together numbers that were never one:
+    /// "6164092861 6164092860" becomes twenty digits in a row, and neither invoice stands alone in
+    /// it. The false match above is glued in both forms, so it is refused either way.
+    /// </remarks>
+    private static bool StandsAlone(string haystack, string needle)
+    {
+        for (var at = haystack.IndexOf(needle, StringComparison.Ordinal); at >= 0;
+             at = haystack.IndexOf(needle, at + 1, StringComparison.Ordinal))
+        {
+            var end = at + needle.Length;
+
+            var gluedBefore = at > 0 && char.IsAsciiDigit(needle[0]) && char.IsAsciiDigit(haystack[at - 1]);
+            var gluedAfter = end < haystack.Length && char.IsAsciiDigit(needle[^1]) && char.IsAsciiDigit(haystack[end]);
+
+            if (!gluedBefore && !gluedAfter) return true;
+        }
+
+        return false;
     }
 
     /// <summary>Payments sent to the bank, keyed by their order reference (<c>TrP_EndToEndId</c>).</summary>
@@ -168,10 +204,14 @@ public sealed class DocumentIndex
     }
 
     /// <summary>Finds a receivable by the KSeF number typed into the payment title.</summary>
-    public IReadOnlyList<ReferenceHit> ResolveKsef(string ksefNumber, int contractorId)
+    public IReadOnlyList<ReferenceHit> ResolveKsef(string ksefNumber, int contractorId, string? currency = null)
     {
         var key = NormalizeKsef(ksefNumber);
-        if (key.Length == 0 || !_byKsef.TryGetValue(key, out var candidates)) return [];
+        if (key.Length == 0 || !_byKsef.TryGetValue(key, out var all)) return [];
+
+        // One invoice can carry payments in two currencies, and both answer to its KSeF number.
+        var candidates = InCurrency(all, currency);
+        if (candidates.Count == 0) return [];
 
         var reference = new DocumentReference(
             DocumentKind.AnyInvoice, 0, null, null, ReferenceStrength.FullNumber, ksefNumber);
@@ -372,7 +412,11 @@ public sealed class DocumentIndex
     /// </summary>
     /// <param name="reference">The reference read out of the payment title.</param>
     /// <param name="contractorId">Contractor established for the payment (0 = unknown).</param>
-    public IReadOnlyList<ReferenceHit> Resolve(DocumentReference reference, int contractorId)
+    /// <param name="currency">
+    /// The payment's currency. Items in any other are not candidates at all - see
+    /// <see cref="InCurrency"/> for why that has to happen here rather than afterwards.
+    /// </param>
+    public IReadOnlyList<ReferenceHit> Resolve(DocumentReference reference, int contractorId, string? currency = null)
     {
         var hits = new List<ReferenceHit>();
 
@@ -386,6 +430,7 @@ public sealed class DocumentIndex
             string reason,
             (DocumentKind Kind, int Number)? viaRelated = null)
         {
+            candidates = InCurrency(candidates, currency);
             if (candidates.Count == 0) return;
 
             // The contractor narrows the result: if any item belongs to them, the rest is dropped.
@@ -512,6 +557,20 @@ public sealed class DocumentIndex
 
         return hits;
     }
+
+    /// <summary>The candidates a payment in this currency could settle - all of them when it is not known.</summary>
+    /// <remarks>
+    /// Applied before anything is scored, because what comes after counts the candidates: two
+    /// documents sharing a number are an ambiguity, and an ambiguity halves the score and makes the
+    /// hit unreliable. A payment in another currency is not a rival, and counting it as one cost
+    /// JAG-PRO a whole transfer. Its EUR invoices carry a PLN payment beside the EUR one under the
+    /// same number, so every number named in a 218 622,04 EUR title came out ambiguous - and the
+    /// only two settled were the two with no PLN twin, 9 180,72 of the 192 267,00 it named.
+    /// </remarks>
+    private static IReadOnlyList<OpenReceivable> InCurrency(IReadOnlyList<OpenReceivable> candidates, string? currency) =>
+        string.IsNullOrWhiteSpace(currency)
+            ? candidates
+            : [.. candidates.Where(c => string.Equals(c.Currency, currency, StringComparison.OrdinalIgnoreCase))];
 
     /// <summary>Years in which a related document with the given number exists - used when the customer gave no year.</summary>
     private IReadOnlyList<int> RelatedYears(DocumentKind kind, int number) =>

@@ -47,7 +47,7 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
         var contractorId = contractor.Id;
         var contractorSource = contractor.Source;
         var hits = ResolveHits(parsed, contractorId, index, payment.Currency);
-        AddForeignNumberHits(payment, index, hits);
+        AddForeignNumberHits(payment, index, contractorId, hits);
 
         if (contractorId == 0 && hits.Count > 0)
         {
@@ -57,7 +57,7 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
                 contractorId = inferred.Value.ContractorId;
                 contractorSource = inferred.Value.Source;
                 hits = ResolveHits(parsed, contractorId, index, payment.Currency);
-                AddForeignNumberHits(payment, index, hits);
+                AddForeignNumberHits(payment, index, contractorId, hits);
             }
         }
 
@@ -259,8 +259,16 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
     /// On outgoing transfers this is the strongest evidence the title offers: we describe them
     /// with the supplier's invoice number, not our own. For receivables the foreign number is
     /// empty, so the same method changes nothing on incoming payments.
+    ///
+    /// Strong within its supplier and meaningless outside it. Invoice numbers at the supplier's
+    /// end follow nobody's scheme - "9/2026" is as good a number for one company as for the next -
+    /// so once the contractor is known, a document of anybody else is not evidence of anything.
+    /// It was taken anyway, at full strength and marked reliable: a transfer to BB Słodycze, the
+    /// payee named by its own bank account and by the order reference, settled 1 639,59 against
+    /// Marek Lach's invoice because Lach's number turned up inside the title.
     /// </remarks>
-    private static void AddForeignNumberHits(BankPayment payment, DocumentIndex index, List<ReferenceHit> hits)
+    private static void AddForeignNumberHits(
+        BankPayment payment, DocumentIndex index, int contractorId, List<ReferenceHit> hits)
     {
         var known = hits
             .Select(h => (h.Receivable.PaymentDocType, h.Receivable.PaymentDocId, h.Receivable.PaymentLp))
@@ -268,6 +276,11 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
 
         foreach (var document in index.FindByForeignNumber(payment.Description))
         {
+            if (contractorId != 0 && document.ContractorId != contractorId) continue;
+
+            // As for our own numbers: a payment settles nothing in another currency.
+            if (!string.Equals(document.Currency, payment.Currency, StringComparison.OrdinalIgnoreCase)) continue;
+
             var key = (document.PaymentDocType, document.PaymentDocId, document.PaymentLp);
             if (!known.Add(key)) continue;
 
@@ -389,8 +402,6 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
         {
             foreach (var hit in hits)
             {
-                if (!string.Equals(hit.Receivable.Currency, currency, StringComparison.OrdinalIgnoreCase)) continue;
-
                 var key = (hit.Receivable.PaymentDocType, hit.Receivable.PaymentDocId, hit.Receivable.PaymentLp);
                 if (!best.TryGetValue(key, out var existing) || hit.Score > existing.Score)
                 {
@@ -399,15 +410,18 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
             }
         }
 
+        // The currency goes to the index rather than being checked here: a document in another
+        // currency must not even be counted as a rival, or it makes the right one look ambiguous.
+
         // A KSeF number is unambiguous, so it goes first.
         foreach (var ksef in parsed.KsefNumbers)
         {
-            Register(index.ResolveKsef(ksef, contractorId));
+            Register(index.ResolveKsef(ksef, contractorId, currency));
         }
 
         foreach (var reference in parsed.References)
         {
-            Register(index.Resolve(reference, contractorId));
+            Register(index.Resolve(reference, contractorId, currency));
         }
 
         return [.. best.Values];

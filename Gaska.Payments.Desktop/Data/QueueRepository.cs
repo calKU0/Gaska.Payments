@@ -356,18 +356,25 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
     /// What is filtered out are the types ERP will not settle against a cash entry at all - see
     /// <see cref="SettlementDocumentTypes"/>.
     /// </remarks>
+    /// <param name="currency">
+    /// The transfer's currency: only items in it are listed. A transfer settles nothing in
+    /// another currency, and some contractors keep a second payment in PLN beside each EUR one
+    /// under the same invoice number - JAG-PRO has 45 such pairs - so the list otherwise showed
+    /// every invoice twice, once as something the transfer could never close. Empty lists them all.
+    /// </param>
     public Task<IReadOnlyList<DocumentRow>> GetOpenDocumentsAsync(
-        int contractorId, CancellationToken token = default)
+        int contractorId, string currency, CancellationToken token = default)
     {
         var sql = $$"""
             {{DocumentSelect}}
               AND pl.TrP_KntNumer = @knt
               AND pl.TrP_Rozliczona IN (0, 2)
               AND pl.TrP_Pozostaje > 0
+              AND (@currency = '' OR RTRIM(pl.TrP_Waluta) = @currency)
             ORDER BY pl.TrP_Termin, pl.TrP_GIDNumer
             """;
 
-        return ReadDocumentsAsync(sql, token, ("@knt", contractorId));
+        return ReadDocumentsAsync(sql, token, ("@knt", contractorId), ("@currency", currency.Trim()));
     }
 
     private async Task<IReadOnlyList<DocumentRow>> ReadDocumentsAsync(
