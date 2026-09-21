@@ -74,6 +74,7 @@ builder.Services.AddSingleton(sp => new PostingRepository(
 builder.Services.AddSingleton<XlSessionHost>();
 builder.Services.AddSingleton<ErpPostingService>();
 builder.Services.AddHostedService<PaymentCycleWorker>();
+builder.Services.AddHostedService<SettlementAdvisorWorker>();
 
 try
 {

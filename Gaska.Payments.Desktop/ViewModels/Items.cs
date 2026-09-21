@@ -6,18 +6,34 @@ using Gaska.Payments.Desktop.Mvvm;
 
 namespace Gaska.Payments.Desktop.ViewModels;
 
-/// <summary>A document on the selection list - with its tick and whether the service suggested it.</summary>
+/// <summary>
+/// A document on the selection list - with its tick, and who proposed it: the service, the model,
+/// or nobody.
+/// </summary>
+/// <param name="advice">The model's proposal for this document, or null when it named none.</param>
 public sealed class DocumentItem(
-    DocumentRow row, bool suggested, bool paymentIsIncoming) : ObservableObject
+    DocumentRow row, bool suggested, SuggestionRow? advice, bool paymentIsIncoming) : ObservableObject
 {
     // A hint on a payment somebody has since flagged "nie rozliczaj" is stale: the badge still
     // says the service matched it, but it does not arrive ticked - settling it would undo a
-    // decision already made in ERP.
+    // decision already made in ERP. The model's documents never arrive ticked: it is a second
+    // opinion for the accountant to weigh, not a match.
     private bool _isSelected = suggested && !row.DoNotSettle;
 
     public DocumentRow Row { get; } = row;
 
+    /// <summary>The matching engine assigned this document to the transfer.</summary>
     public bool IsSuggested { get; } = suggested;
+
+    /// <summary>The language model proposed this document.</summary>
+    public bool IsAdvised => advice is not null;
+
+    /// <summary>What the model would settle against the document, and why, for the badge's tooltip.</summary>
+    public string AdviceText => advice is null
+        ? string.Empty
+        : advice.Reason.Length > 0
+            ? $"AI proponuje rozliczyć {advice.Amount:N2}. {advice.Reason}"
+            : $"AI proponuje rozliczyć {advice.Amount:N2}.";
 
     public bool IsSelected
     {
@@ -218,6 +234,19 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
 
     /// <summary>Why the engine classified the payment the way it did.</summary>
     public string Notes => Row.Notes;
+
+    /// <summary>
+    /// The language model's reasoning on the transfer, or word that it is still thinking. Empty
+    /// when it has not been asked.
+    /// </summary>
+    public string AdvisorText => Row.AdvisorStatus switch
+    {
+        "Done" => Row.AdvisorSummary.Length > 0 ? Row.AdvisorSummary : "AI nie wskazało dokumentów.",
+        "Running" => "AI analizuje ten przelew…",
+        _ => string.Empty,
+    };
+
+    public bool HasAdvisorText => AdvisorText.Length > 0;
 
     /// <summary>
     /// The side of the ledger this transfer settles, in the genitive, to be dropped into a

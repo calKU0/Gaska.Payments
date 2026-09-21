@@ -50,7 +50,14 @@ public sealed record PaymentRow(
     /// employee. Empty for everything the application can settle; when it is filled in, the
     /// transfer is shown but left alone, because settlement in XL only knows contractors.
     /// </summary>
-    string OtherParty);
+    string OtherParty,
+    /// <summary>
+    /// Where the language model's question about this transfer stands - <c>Running</c> or
+    /// <c>Done</c> - and empty when it was never asked, or failed.
+    /// </summary>
+    string AdvisorStatus,
+    /// <summary>The model's reasoning for the transfer as a whole. Empty until it has answered.</summary>
+    string AdvisorSummary);
 
 /// <summary>An open document payment in ERP.</summary>
 /// <param name="PaymentType">1 is a liability, 2 a receivable.</param>
@@ -114,7 +121,17 @@ public sealed record DocumentRow(
     public bool IsLiability => PaymentType == 1;
 }
 
-/// <summary>The service's hint: a document the matching engine assigned to a transfer.</summary>
+/// <summary>Who proposed a document for a transfer.</summary>
+public enum SuggestionSource
+{
+    /// <summary>The matching engine - its documents arrive ticked.</summary>
+    Service,
+
+    /// <summary>The language model asked about what the engine could not settle - never ticked.</summary>
+    Advisor,
+}
+
+/// <summary>A hint: a document proposed for a transfer, by the engine or by the model.</summary>
 public sealed record SuggestionRow(
     long PaymentId,
     int DocType,
@@ -123,7 +140,8 @@ public sealed record SuggestionRow(
     string DocNumber,
     decimal Amount,
     double Score,
-    string Reason);
+    string Reason,
+    SuggestionSource Source);
 
 /// <summary>
 /// Money from a contractor sitting in ERP against nothing - a payment nobody has allocated.

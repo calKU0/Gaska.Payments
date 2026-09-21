@@ -55,6 +55,38 @@ public sealed class DecisionStore(string connectionString)
 
         IF COL_LENGTH('pay.Payment', 'SourceFile') IS NULL
             ALTER TABLE pay.Payment ADD SourceFile NVARCHAR(400) NULL;
+
+        IF OBJECT_ID('pay.AdvisorReview', 'U') IS NULL
+            CREATE TABLE pay.AdvisorReview
+            (
+                PaymentId     BIGINT          NOT NULL CONSTRAINT PK_AdvisorReview PRIMARY KEY,
+                ContractorId  INT             NOT NULL,
+                Status        VARCHAR(12)     NOT NULL,
+                Attempts      INT             NOT NULL,
+                RequestedAt   DATETIME2(0)    NOT NULL,
+                AnsweredAt    DATETIME2(0)    NULL,
+                NextAttemptAt DATETIME2(0)    NULL,
+                Summary       NVARCHAR(MAX)   NULL,
+                Answer        NVARCHAR(MAX)   NULL,
+                Error         NVARCHAR(1000)  NULL,
+                CONSTRAINT FK_AdvisorReview_Payment FOREIGN KEY (PaymentId)
+                    REFERENCES pay.Payment (PaymentId) ON DELETE CASCADE
+            );
+
+        IF OBJECT_ID('pay.AdvisorAllocation', 'U') IS NULL
+            CREATE TABLE pay.AdvisorAllocation
+            (
+                PaymentId BIGINT          NOT NULL,
+                DocType   INT             NOT NULL,
+                DocId     INT             NOT NULL,
+                DocLp     INT             NOT NULL,
+                DocNumber VARCHAR(50)     NOT NULL,
+                Amount    DECIMAL(19,2)   NOT NULL,
+                Reason    NVARCHAR(1000)  NOT NULL,
+                CONSTRAINT PK_AdvisorAllocation PRIMARY KEY (PaymentId, DocType, DocId, DocLp),
+                CONSTRAINT FK_AdvisorAllocation_Review FOREIGN KEY (PaymentId)
+                    REFERENCES pay.AdvisorReview (PaymentId) ON DELETE CASCADE
+            );
         """);
 
     /// <summary>
@@ -224,6 +256,51 @@ public sealed class DecisionStore(string connectionString)
         command.Parameters.AddWithValue("@swift", Trim(swift, 20));
 
         return command.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Brings an archived account back onto the contractor's card. Returns whether one was found.
+    /// </summary>
+    /// <remarks>
+    /// <c>XLNowyRachunek</c> refuses a number the card already holds, archived or not, and the API
+    /// has no function to take an account out of the archive - so this is a direct update, the
+    /// same one ERP makes when the box is cleared on the card: <c>RkB_CzasArchiwizacji</c> back to
+    /// zero, which is what every account in use carries. Only when the contractor holds no live
+    /// copy of the number, and only the most recently archived copy when there are several - one
+    /// live account per number is what the lookup by account expects.
+    /// </remarks>
+    public bool RestoreArchivedAccount(int contractorId, string account)
+    {
+        const string sql = """
+            WITH archiwalny AS (
+                SELECT TOP 1 RkB_CzasArchiwizacji, RkB_CzasModyfikacji
+                FROM CDN.RachunkiBankowe
+                WHERE RkB_ObiTyp = 32
+                  AND RkB_ObiNumer = @knt
+                  AND RkB_CzasArchiwizacji <> 0
+                  AND REPLACE(RTRIM(RkB_NrRachunku), ' ', '') IN (@pelny, @bezKraju)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM CDN.RachunkiBankowe AS zywy
+                      WHERE zywy.RkB_ObiTyp = 32
+                        AND zywy.RkB_ObiNumer = @knt
+                        AND zywy.RkB_CzasArchiwizacji = 0
+                        AND REPLACE(RTRIM(zywy.RkB_NrRachunku), ' ', '') IN (@pelny, @bezKraju))
+                ORDER BY RkB_CzasArchiwizacji DESC
+            )
+            UPDATE archiwalny
+            SET RkB_CzasArchiwizacji = 0,
+                RkB_CzasModyfikacji = DATEDIFF(SECOND, '1990-01-01', GETDATE());
+            """;
+
+        using var connection = new SqlConnection(connectionString);
+        connection.Open();
+
+        using var command = new SqlCommand(sql, connection) { CommandTimeout = 60 };
+        command.Parameters.AddWithValue("@knt", contractorId);
+        command.Parameters.AddWithValue("@pelny", IbanParts.Compact(account));
+        command.Parameters.AddWithValue("@bezKraju", IbanParts.WithoutCountryCode(account));
+
+        return command.ExecuteNonQuery() > 0;
     }
 
     /// <summary>

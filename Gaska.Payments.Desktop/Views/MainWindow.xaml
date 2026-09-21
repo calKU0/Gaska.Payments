@@ -565,9 +565,19 @@
                             <TextBlock Text="{Binding ContractorSourceLabel}" Style="{StaticResource Subtle}"
                                        Margin="0,0,0,12" />
 
-                            <TextBlock Text="Dlaczego taka klasyfikacja" Style="{StaticResource Label}" />
+                            <TextBlock Text="Uzasadnienie" Style="{StaticResource Label}" />
                             <TextBox Text="{Binding Notes, Mode=OneWay}" Style="{StaticResource Selectable}"
                                      Foreground="{StaticResource Muted}" Margin="0,0,0,12" />
+
+                            <!--
+                                Co o przelewie sądzi model AI, o który serwis pyta, gdy sam nie
+                                poradził sobie z dopasowaniem. Tylko gdy został zapytany.
+                            -->
+                            <StackPanel Visibility="{Binding HasAdvisorText, Converter={StaticResource BoolToVisibility}}">
+                                <TextBlock Text="Uzasadnienie AI" Style="{StaticResource Label}" />
+                                <TextBox Text="{Binding AdvisorText, Mode=OneWay}" Style="{StaticResource Selectable}"
+                                         Foreground="{StaticResource Muted}" Margin="0,0,0,12" />
+                            </StackPanel>
 
                             <TextBlock Text="Sposób dopasowania" Style="{StaticResource Label}" />
                             <TextBlock Text="{Binding StrategyLabel}" Style="{StaticResource Subtle}" TextWrapping="Wrap" />
@@ -692,15 +702,29 @@
                                                     SortMemberPath="DueDate"
                                                     ElementStyle="{StaticResource CellText}" />
 
-                                <DataGridTemplateColumn Header="Podpowiedź serwisu" Width="*" MinWidth="124">
+                                <!--
+                                    Kto zaproponował dokument. Serwis - silnik dopasowania, jego
+                                    dokumenty przychodzą zaznaczone. AI - model pytany o przelewy,
+                                    z którymi serwis sobie nie poradził; nigdy nie zaznacza, tylko
+                                    podpowiada, a w dymku mówi, ile i dlaczego.
+                                -->
+                                <DataGridTemplateColumn Header="Podpowiedział" Width="*" MinWidth="124">
                                     <DataGridTemplateColumn.CellTemplate>
                                         <DataTemplate>
-                                            <Border Style="{StaticResource Badge}" Background="{StaticResource AccentSoft}" Margin="10,0,0,0"
-                                                    ToolTip="Ten dokument przypisał do przelewu silnik dopasowania – dlatego jest zaznaczony."
-                                                    Visibility="{Binding IsSuggested, Converter={StaticResource BoolToVisibility}}">
-                                                <TextBlock Text="dopasował serwis" Style="{StaticResource BadgeText}"
-                                                           Foreground="{StaticResource Accent}" />
-                                            </Border>
+                                            <StackPanel Orientation="Horizontal" Margin="10,0,0,0">
+                                                <Border Style="{StaticResource Badge}" Background="{StaticResource AccentSoft}" Margin="0,0,6,0"
+                                                        ToolTip="Ten dokument przypisał do przelewu silnik dopasowania – dlatego jest zaznaczony."
+                                                        Visibility="{Binding IsSuggested, Converter={StaticResource BoolToVisibility}}">
+                                                    <TextBlock Text="Serwis" Style="{StaticResource BadgeText}"
+                                                               Foreground="{StaticResource Accent}" />
+                                                </Border>
+                                                <Border Style="{StaticResource Badge}" Background="{StaticResource AdvisorSoft}"
+                                                        ToolTip="{Binding AdviceText}"
+                                                        Visibility="{Binding IsAdvised, Converter={StaticResource BoolToVisibility}}">
+                                                    <TextBlock Text="AI" Style="{StaticResource BadgeText}"
+                                                               Foreground="{StaticResource Advisor}" />
+                                                </Border>
+                                            </StackPanel>
                                         </DataTemplate>
                                     </DataGridTemplateColumn.CellTemplate>
                                 </DataGridTemplateColumn>

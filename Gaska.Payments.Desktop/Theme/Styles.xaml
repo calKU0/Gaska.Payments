@@ -36,6 +36,9 @@
     <SolidColorBrush x:Key="WarnSoft" Color="#FFF7ED" />
     <SolidColorBrush x:Key="Bad" Color="#B91C1C" />
     <SolidColorBrush x:Key="BadSoft" Color="#FEF2F2" />
+    <!-- What the AI proposed: a colour of its own, so it is never taken for the service's match. -->
+    <SolidColorBrush x:Key="Advisor" Color="#6D28D9" />
+    <SolidColorBrush x:Key="AdvisorSoft" Color="#F5F3FF" />
 
     <!-- ============================== typography ============================== -->
 
