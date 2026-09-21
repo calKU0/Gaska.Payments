@@ -51,6 +51,13 @@ public sealed class PostingJournal(string connectionString)
         ("@konto", account));
 
     /// <summary>
+    /// Gives an unsettled entry its contractor's usual contra account, when it has none. See
+    /// <see cref="CashEntrySql.SetEntryAccount"/>.
+    /// </summary>
+    public void UpdateEntryAccount(int entryId, int contractorId) => Execute(
+        CashEntrySql.SetEntryAccount, ("@entry", entryId), ("@contractor", contractorId));
+
+    /// <summary>
     /// Writes the numbers of the settled documents onto the entry, in place of the bank's
     /// reference. See <see cref="CashEntrySql.SetEntryDocumentNumber"/>.
     /// </summary>

@@ -41,6 +41,16 @@ public sealed class RegisterSettings
     /// </remarks>
     public List<string> UncheckedRegisters { get; set; } = [];
 
+    /// <summary>
+    /// The register the card terminal's payments are booked on. Its entries carry the terminal's
+    /// transaction number rather than a contractor worth the name - most card receipts are made out
+    /// to the one-off customer - so their documents are found by that number instead.
+    /// </summary>
+    public string CardTerminalRegister { get; set; } = "KARTA";
+
+    public bool IsCardTerminal(string series) =>
+        CardTerminalRegister.Length > 0 && series.Trim().Equals(CardTerminalRegister, StringComparison.OrdinalIgnoreCase);
+
     /// <summary>Every register the application shows, in the order the filter lists them.</summary>
     public IReadOnlyList<string> All => [.. Registers, .. CardRegisters, .. PostOnlyRegisters];
 

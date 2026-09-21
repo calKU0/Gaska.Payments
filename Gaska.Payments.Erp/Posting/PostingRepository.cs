@@ -61,9 +61,42 @@ public sealed record PendingOperation(
     public int ErpContractorId => PostingCategory switch
     {
         PaymentCategory.Card or PaymentCategory.PostOnly => 0,
-        PaymentCategory.SplitPayment or PaymentCategory.Cod => ContractorId,
+        // The party comes from the document, or is Fiserv's own card - known either way.
+        PaymentCategory.SplitPayment or PaymentCategory.Cod
+            or PaymentCategory.Polcard or PaymentCategory.PolcardFee => ContractorId,
         _ => ContractorFromBankAccount ? ContractorId : 0,
     };
+
+    /// <summary>Whether the entry names a contractor at all - which is not the same as a non-zero id.</summary>
+    /// <remarks>
+    /// The one-off customer, JEDNORAZOWY, is contractor number 0, and most receipts paid by card are
+    /// made out to it. A card payment with a document to close is therefore always booked on a
+    /// contractor, number 0 included, as the register's entries have always been; without a
+    /// document there is nobody to name, and 0 means no party.
+    /// </remarks>
+    /// <summary>
+    /// Whether an entry left unsettled should still get its contractor's contra account.
+    /// </summary>
+    /// <remarks>
+    /// Only where the contractor is certain - named by the payer's account, or by the document
+    /// itself for a parcel or a card payment, or Fiserv for its commission - and only for the kinds
+    /// the accountants give an account to. Split payment legs and bank charges keep to their own
+    /// handling.
+    /// </remarks>
+    public bool CarriesAccount =>
+        ErpContractorId != 0
+        && PostingCategory is PaymentCategory.Standard or PaymentCategory.Cod
+            or PaymentCategory.Polcard or PaymentCategory.PolcardFee;
+
+    public bool NamesContractor =>
+        ErpContractorId != 0
+        || (PostingCategory == PaymentCategory.Polcard && DocumentNumbers.Length > 0);
+}
+
+/// <summary>The card terminal's cash operations, as configured under <c>Cards</c>.</summary>
+public sealed record CardOperationSymbols(string Sale, string Refund, string Fee)
+{
+    public static readonly CardOperationSymbols None = new(string.Empty, string.Empty, string.Empty);
 }
 
 /// <summary>An entry already created in ERP that is waiting only to be settled.</summary>
@@ -92,7 +125,12 @@ public sealed class PostingRepository(string connectionString)
     /// <returns>The number of operations released for posting again.</returns>
     public async Task<int> ReleaseMissingEntriesAsync(CancellationToken cancellationToken = default)
     {
+        // Only the first statement's count is returned. The second clears the settlement links of
+        // the same operations, and adding the two together had the log report 46 entries gone
+        // when 24 were - each settled one counted twice.
         const string sql = """
+            SET NOCOUNT ON;
+
             UPDATE p
             SET p.ErpEntryId = NULL, p.ErpReportId = NULL, p.PostedAt = NULL,
                 p.SettledAt = NULL,
@@ -101,17 +139,21 @@ public sealed class PostingRepository(string connectionString)
             WHERE p.ErpEntryId IS NOT NULL
               AND NOT EXISTS (SELECT 1 FROM CDN.Zapisy AS z WHERE z.KAZ_GIDNumer = p.ErpEntryId);
 
+            DECLARE @released INT = @@ROWCOUNT;
+
             UPDATE a
             SET a.SettlementId = NULL
             FROM pay.Allocation AS a
             JOIN pay.Payment AS p ON p.PaymentId = a.PaymentId
             WHERE a.SettlementId IS NOT NULL AND p.ErpEntryId IS NULL;
+
+            SELECT @released;
             """;
 
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
         await using var command = new SqlCommand(sql, connection) { CommandTimeout = 120 };
-        return await command.ExecuteNonQueryAsync(cancellationToken);
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
     }
 
     /// <summary>
@@ -267,22 +309,33 @@ public sealed class PostingRepository(string connectionString)
     /// None of this applies in buffer mode: an entry in the buffer hangs off the register rather
     /// than off a report, and the day does not come into it.
     /// </remarks>
-    private const string PastDay = """
+    private const string PastDay = $"""
         (
             EXISTS (
                 SELECT 1
                 FROM CDN.Raporty AS newer
                 WHERE RTRIM(newer.KRP_Seria) = p.RegisterSeries
-                  AND newer.KRP_DataOtwarcia > DATEDIFF(DAY, '1800-12-28', p.BookingDate)
+                  AND newer.KRP_DataOtwarcia > {ReportDay}
             )
             AND NOT EXISTS (
                 SELECT 1
                 FROM CDN.Raporty AS own
                 WHERE RTRIM(own.KRP_Seria) = p.RegisterSeries
-                  AND own.KRP_DataOtwarcia = DATEDIFF(DAY, '1800-12-28', p.BookingDate)
+                  AND own.KRP_DataOtwarcia = {ReportDay}
                   AND ISNULL(own.KRP_DataZamkniecia, 0) = 0
             )
         )
+        """;
+
+    /// <summary>
+    /// The opening day of the report an operation belongs to, as ERP counts days - its own day, or
+    /// the first of its month for the card terminal (see <c>PaymentCategory.InMonthlyReport</c>).
+    /// </summary>
+    private const string ReportDay = """
+        DATEDIFF(DAY, '1800-12-28',
+            CASE WHEN p.PostingCategory IN ('Polcard', 'PolcardFee')
+                 THEN DATEFROMPARTS(YEAR(p.BookingDate), MONTH(p.BookingDate), 1)
+                 ELSE p.BookingDate END)
         """;
 
     /// <summary>
@@ -425,9 +478,12 @@ public sealed class PostingRepository(string connectionString)
         string feeOperation = "PRW",
         string codOperation = "",
         bool toBuffer = false,
+        CardOperationSymbols? cardOperations = null,
         CancellationToken cancellationToken = default)
     {
         if (registers.Count == 0) return [];
+
+        var card = cardOperations ?? CardOperationSymbols.None;
 
         var parameters = registers.Select((_, i) => $"@r{i}").ToArray();
 
@@ -438,7 +494,7 @@ public sealed class PostingRepository(string connectionString)
                    p.PaymentId, p.BankExternalId, p.RegisterSeries, p.BookingDate, p.Amount, p.Currency,
                    p.Direction, p.ContractorId, p.Description, p.PayerName, p.Confidence, p.Status,
                    p.ContractorFromBankAccount,
-                   RTRIM(COALESCE(cod.KAO_Kod, fee.KAO_Kod, op.KAO_Kod, '')) AS OperationSymbol,
+                   RTRIM(COALESCE(cod.KAO_Kod, card.KAO_Kod, fee.KAO_Kod, op.KAO_Kod, '')) AS OperationSymbol,
                    p.PostingCategory,
                    ISNULL(doc.Numbers, '')                                   AS DocumentNumbers
             FROM pay.Payment AS p
@@ -490,6 +546,20 @@ public sealed class PostingRepository(string connectionString)
                   AND c.KAO_Kod = @codOperation
             ) AS cod
             OUTER APPLY (
+                -- The card terminal: a sale, a refund, or Fiserv's commission, each with an
+                -- operation of its own - named in configuration, and checked here against the
+                -- operations the register offers, like cash on delivery's.
+                SELECT TOP 1 k.KAO_Kod
+                FROM CDN.RejOp AS ro
+                INNER JOIN CDN.Operacje AS k
+                    ON k.KAO_GIDNumer = ro.KRO_KAONumer AND k.KAO_GIDTyp = ro.KRO_KAOTyp
+                WHERE p.PostingCategory IN ('Polcard', 'PolcardFee')
+                  AND ro.KRO_KARNumer = r.KAR_GIDNumer
+                  AND k.KAO_Kod = CASE WHEN p.PostingCategory = 'PolcardFee' THEN @cardFee
+                                       WHEN p.Direction = 'P' THEN @cardSale
+                                       ELSE @cardRefund END
+            ) AS card
+            OUTER APPLY (
                 -- The documents the operation is to close, for the entry's own number field.
                 SELECT STRING_AGG(a.DocNumber, ', ') WITHIN GROUP (ORDER BY a.DocNumber) AS Numbers
                 FROM pay.Allocation AS a
@@ -511,6 +581,9 @@ public sealed class PostingRepository(string connectionString)
         command.Parameters.AddWithValue("@from", from.Date);
         command.Parameters.AddWithValue("@feeOperation", feeOperation);
         command.Parameters.AddWithValue("@codOperation", codOperation);
+        command.Parameters.AddWithValue("@cardSale", card.Sale);
+        command.Parameters.AddWithValue("@cardRefund", card.Refund);
+        command.Parameters.AddWithValue("@cardFee", card.Fee);
 
         var index = 0;
         foreach (var register in registers) command.Parameters.AddWithValue(parameters[index++], register);

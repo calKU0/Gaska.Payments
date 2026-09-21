@@ -321,9 +321,11 @@ public sealed class MainViewModel : ObservableObject
     /// A ticked document always does, whatever is filtered out. Its amount is in the totals under
     /// the list and it is about to be settled - hiding it would leave the sums unexplained, and a
     /// correction the service itself matched is exactly the liability the default filter drops.
+    /// The same goes for what the AI proposed: a proposal the filter hides is one nobody weighs.
     /// </remarks>
     private bool ShowsDocument(DocumentItem document) =>
         document.IsSelected
+        || document.IsAdvised
         || (DocumentSideFilters.Any(f => f.IsSelected && f.IsLiability == document.Row.IsLiability)
             && DocumentStateFilters.Any(f => f.IsSelected && f.State == document.SettlementState));
 
@@ -1092,6 +1094,35 @@ public sealed class MainViewModel : ObservableObject
             ? []
             : await _repository.GetOpenDocumentsAsync(contractorId, item.Row.Currency);
 
+        // A card terminal payment names its document by the transaction number in the entry's
+        // description - and the document is usually made out to the one-off customer, contractor 0,
+        // whom the lookup above cannot reach. So those are found by the number, and put first.
+        if (_registers.IsCardTerminal(item.Row.RegisterSeries) && item.Row.PayerName.Trim().Length > 0)
+        {
+            var byNumber = await _repository.GetDocumentsByCardNumberAsync(item.Row.PayerName, item.Row.Currency);
+
+            documents = [.. byNumber
+                .Concat(documents)
+                .DistinctBy(d => (d.DocType, d.DocId, d.DocLp))];
+        }
+
+        // The model may name a document that is not the contractor's own - a receipt on the
+        // one-off customer, an invoice on a related company - and a proposal nobody can see is no
+        // help. Those are fetched by their key and put first, like the card numbers above.
+        var loaded = documents.Select(d => (d.DocType, d.DocId, d.DocLp)).ToHashSet();
+        var missing = item.Suggestions
+            .Where(s => s.Source == SuggestionSource.Advisor)
+            .Select(s => (s.DocType, s.DocId, s.DocLp))
+            .Where(key => !loaded.Contains(key))
+            .Distinct()
+            .ToList();
+
+        if (missing.Count > 0)
+        {
+            var advised = await _repository.GetDocumentsByKeysAsync(missing, item.Row.Currency);
+            documents = [.. advised.Concat(documents)];
+        }
+
         Fill(item, documents);
     }
 
@@ -1107,13 +1138,20 @@ public sealed class MainViewModel : ObservableObject
         item.Documents.Clear();
 
         var suggested = item.Suggestions
+            .Where(s => s.Source == SuggestionSource.Service)
             .Select(s => (s.DocType, s.DocId, s.DocLp))
             .ToHashSet();
 
+        var advised = item.Suggestions
+            .Where(s => s.Source == SuggestionSource.Advisor)
+            .DistinctBy(s => (s.DocType, s.DocId, s.DocLp))
+            .ToDictionary(s => (s.DocType, s.DocId, s.DocLp));
+
         foreach (var row in documents)
         {
-            var isSuggested = suggested.Contains((row.DocType, row.DocId, row.DocLp));
-            var document = new DocumentItem(row, isSuggested, item.Row.IsIncoming);
+            var key = (row.DocType, row.DocId, row.DocLp);
+            var document = new DocumentItem(
+                row, suggested.Contains(key), advised.GetValueOrDefault(key), item.Row.IsIncoming);
 
             // A tick can bring a document past the filter, and clearing one can take it away
             // again - the list has to be re-run either way.
@@ -1496,8 +1534,8 @@ public sealed class MainViewModel : ObservableObject
 
             return plan
                 .Select(x => (x.Account, x.ContractorId, x.Bank,
-                    Error: accounts.Assign(
-                        session, x.ContractorId, x.Account, x.Currency, x.Bank?.Code, BicOf(x.Bank))))
+                    Outcome: PutAccountOnCard(session, accounts, x.ContractorId, x.Account, x.Currency, x.Bank)))
+                .Select(x => (x.Account, x.ContractorId, x.Bank, x.Outcome.Error, x.Outcome.Restored))
                 .ToList();
         });
 
@@ -1505,7 +1543,10 @@ public sealed class MainViewModel : ObservableObject
             results.Where(r => r.Error is null).Select(r => (r.ContractorId, r.Account, r.Bank)));
 
         var added = results.Count(r => r.Error is null);
+        var restored = results.Count(r => r.Error is null && r.Restored);
         var failed = results.Where(r => r.Error is not null).ToList();
+
+        var fromArchive = restored == 0 ? string.Empty : $" (w tym {restored} przywrócone z archiwum)";
 
         var withoutBank = bankless.Count == 0
             ? string.Empty
@@ -1514,7 +1555,7 @@ public sealed class MainViewModel : ObservableObject
         if (failed.Count == 0)
         {
             Notify(
-                $"Dopisano {added} rachunków do kartotek kontrahentów.{withoutBank}",
+                $"Dopisano {added} rachunków do kartotek kontrahentów{fromArchive}.{withoutBank}",
                 bankless.Count == 0 ? ToastKind.Success : ToastKind.Warning);
             return;
         }
@@ -1523,8 +1564,35 @@ public sealed class MainViewModel : ObservableObject
         if (failed.Count > 3) details += $"  ·  i {failed.Count - 3} więcej";
 
         Notify(
-            $"Dopisano {added} z {results.Count} rachunków. Nieudane – {details}{withoutBank}",
+            $"Dopisano {added} z {results.Count} rachunków{fromArchive}. Nieudane – {details}{withoutBank}",
             ToastKind.Warning);
+    }
+
+    /// <summary>What putting an account on a card came to: an error, or whether it came out of the archive.</summary>
+    private sealed record AccountOutcome(string? Error, bool Restored);
+
+    /// <summary>
+    /// Puts the account on the contractor's card: brings back the archived copy when the card
+    /// holds one, adds it through <c>XLNowyRachunek</c> otherwise.
+    /// </summary>
+    /// <remarks>
+    /// Runs on the XL session's thread. The archive is looked at first because XL refuses a number
+    /// the card already holds even when it is archived - the operator got "istnieje już rachunek"
+    /// for an account the service could not recognise the payer by.
+    /// </remarks>
+    private AccountOutcome PutAccountOnCard(
+        XlSession session, XlContractorAccounts accounts, int contractorId, string account, string currency,
+        BankRef? bank)
+    {
+        if (contractorId != 0 && _store.RestoreArchivedAccount(contractorId, account))
+        {
+            _logger.LogInformation(
+                "Account {Account} of contractor {Contractor} brought back from the archive.", account, contractorId);
+            return new AccountOutcome(null, Restored: true);
+        }
+
+        return new AccountOutcome(
+            accounts.Assign(session, contractorId, account, currency, bank?.Code, BicOf(bank)), Restored: false);
     }
 
     private sealed record SettleRequest(
@@ -1826,12 +1894,12 @@ public sealed class MainViewModel : ObservableObject
 
             var bank = await ResolveBankAsync(item);
 
-            var error = await _worker.RunAsync(session => new XlContractorAccounts(_logger)
-                .Assign(session, contractorId, account, currency, bank?.Code, BicOf(bank)));
+            var outcome = await _worker.RunAsync(session =>
+                PutAccountOnCard(session, new XlContractorAccounts(_logger), contractorId, account, currency, bank));
 
-            if (error is not null)
+            if (outcome.Error is not null)
             {
-                Notify($"Nie udało się dopisać rachunku: {error}", ToastKind.Error);
+                Notify($"Nie udało się dopisać rachunku: {outcome.Error}", ToastKind.Error);
                 return;
             }
 
@@ -1840,10 +1908,14 @@ public sealed class MainViewModel : ObservableObject
             item.MarkAccountAssigned();
             RefreshCommands();
 
+            var done = outcome.Restored
+                ? "Rachunek był w kartotece kontrahenta jako archiwalny – przywrócono go."
+                : "Rachunek dopisany do kartoteki kontrahenta.";
+
             Notify(
                 bankless.Count == 0
-                    ? "Rachunek dopisany do kartoteki kontrahenta."
-                    : "Rachunek dopisany, ale bez banku – wskaż bank na karcie kontrahenta w ERP XL.",
+                    ? done
+                    : $"{done} Nie ma jednak banku – wskaż bank na karcie kontrahenta w ERP XL.",
                 bankless.Count == 0 ? ToastKind.Success : ToastKind.Warning);
         }
         catch (Exception ex)

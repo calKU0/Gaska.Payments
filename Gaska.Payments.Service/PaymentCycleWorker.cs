@@ -1,3 +1,4 @@
+using Gaska.Payments.Application.Cards;
 using Gaska.Payments.Application.Couriers;
 using Gaska.Payments.Application.Posting;
 using Gaska.Payments.Application.Settlement;
@@ -25,6 +26,8 @@ public sealed class PaymentCycleWorker(
     ErpPostingService posting,
     StatementArchive statements,
     CodPipeline cod,
+    CardPipeline cards,
+    SchemaGate schema,
     IOptions<SettlementOptions> options,
     ILogger<PaymentCycleWorker> logger) : BackgroundService
 {
@@ -59,6 +62,8 @@ public sealed class PaymentCycleWorker(
                 schemaReady = await EnsureSchemaAsync(stoppingToken);
                 if (!schemaReady) continue;
             }
+
+            schema.Open();
 
             await RunOnceAsync(stoppingToken);
         }
@@ -106,6 +111,10 @@ public sealed class PaymentCycleWorker(
                 "Cycle {Pass} / run {RunId}: {Fetched} bank operations, {Saved} proposals saved.",
                 pass, summary.RunId, summary.PaymentsFetched, summary.ProposalsSaved);
 
+            // The card terminal goes first: its reports come through the couriers' mailbox, and a
+            // message it has claimed is one the couriers' step then leaves alone.
+            await CollectCardsAsync(summary.RunId, cancellationToken);
+
             // Cash on delivery joins the same run: the parcels become rows of the same shape as
             // the bank operations, so the posting below creates their entries and settles them
             // without knowing where they came from.
@@ -147,6 +156,29 @@ public sealed class PaymentCycleWorker(
     /// Guarded on its own, like the statement archive: a mail server that will not answer is no
     /// reason to stop settling what the bank has already sent us.
     /// </remarks>
+    private async Task CollectCardsAsync(int runId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var step = TimedOperation.Start(logger, "Card terminal: Fiserv's reports");
+
+            var summary = await cards.RunAsync(runId, cancellationToken);
+
+            step.Result(
+                $"{summary.ReportsRead} reports read, {summary.Transactions} transactions: {summary.ToSettle} to settle, "
+                + $"{summary.WithoutSettlement} without settlement, {summary.Skipped} left alone; "
+                + $"{summary.Commissions} commissions booked");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "The card terminal step failed; the cycle carries on.");
+        }
+    }
+
     private async Task CollectCodAsync(int runId, CancellationToken cancellationToken)
     {
         try

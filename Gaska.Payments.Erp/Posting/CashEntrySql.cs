@@ -65,6 +65,39 @@ public static class CashEntrySql
         """;
 
     /// <summary>
+    /// Gives an entry that has none the contra account its contractor's entries carry.
+    /// </summary>
+    /// <remarks>
+    /// For entries posted on a known contractor and left unsettled. The account otherwise arrives
+    /// only with a settlement - ours through <see cref="SetEntryContractor"/>, or ERP's own when an
+    /// accountant settles by hand - and an entry nobody settles never gets one: Fiserv's payout on
+    /// FORPL, the commission on KARTA. Those carried 202-POLCARD for years because somebody typed
+    /// it in afterwards, 1317423 among them three days after it was posted.
+    ///
+    /// Nothing is remembered for a revoke, unlike <see cref="SetEntryContractor"/>: this is part of
+    /// posting the entry, and a revoke is to return to what the automat posted, account included.
+    /// The party type is checked as well, because an employee's or an office's number can be some
+    /// contractor's too.
+    ///
+    /// Parameters: <c>@entry</c>, <c>@contractor</c>.
+    /// </remarks>
+    public const string SetEntryAccount = """
+        DECLARE @konto VARCHAR(50) = (
+            SELECT TOP 1 KAZ_KontoPrzec
+            FROM CDN.Zapisy
+            WHERE KAZ_KNTTyp = 32 AND KAZ_KNTNumer = @contractor AND ISNULL(KAZ_KontoPrzec, '') <> ''
+            GROUP BY KAZ_KontoPrzec
+            ORDER BY COUNT(*) DESC);
+
+        UPDATE CDN.Zapisy
+        SET KAZ_KontoPrzec = @konto
+        WHERE KAZ_GIDNumer = @entry
+          AND @konto IS NOT NULL
+          AND KAZ_KNTTyp = 32 AND KAZ_KNTNumer = @contractor
+          AND ISNULL(RTRIM(KAZ_KontoPrzec), '') = '';
+        """;
+
+    /// <summary>
     /// Writes onto the entry the numbers of the documents it settled.
     /// </summary>
     /// <remarks>

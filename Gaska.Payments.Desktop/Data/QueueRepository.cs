@@ -257,7 +257,11 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                        WHEN z.KAZ_KNTTyp = 944 THEN
                            RTRIM(ISNULL(prc.Prc_Akronim, 'pracownik ' + CAST(z.KAZ_KntNumer AS VARCHAR(12))))
                        ELSE 'podmiot typu ' + CAST(z.KAZ_KNTTyp AS VARCHAR(8))
-                   END AS OtherParty
+                   END AS OtherParty,
+                   -- The model's word on the transfer. An answer about another contractor's
+                   -- documents is stale - the service asks again - so it is not shown.
+                   ISNULL(ar.Status, '')                  AS AdvisorStatus,
+                   ISNULL(ar.Summary, '')                 AS AdvisorSummary
             FROM CDN.Zapisy AS z
             INNER JOIN CDN.Raporty AS rap
                 ON rap.KRP_GIDNumer = z.KAZ_KRPNumer AND rap.KRP_GIDTyp = z.KAZ_KRPTyp
@@ -277,6 +281,9 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                 ON z.KAZ_KNTTyp = 4304 AND urz.URZ_GIDNumer = z.KAZ_KntNumer
             LEFT JOIN CDN.PrcKarty AS prc
                 ON z.KAZ_KNTTyp = 944 AND prc.Prc_GIDNumer = z.KAZ_KntNumer
+            LEFT JOIN pay.AdvisorReview AS ar
+                ON ar.PaymentId = p.PaymentId
+               AND (ar.Status = 'Running' OR (ar.Status = 'Done' AND ar.ContractorId = p.ContractorId))
             WHERE RTRIM(rap.KRP_Seria) IN ({string.Join(", ", seriesParameters)})
               AND rap.KRP_DataOtwarcia >= DATEDIFF(DAY, '1800-12-28', @from)
               {(withHistory ? string.Empty : $"AND z.{HasWorkSql}")}
@@ -307,24 +314,40 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                 reader.GetString(24) == "P", reader.GetString(23),
                 registers.IsCard(reader.GetString(7)), registers.WithoutSettlement(reader.GetString(7)),
                 SettlementStates.Parse(reader.GetString(25)), reader.GetString(26),
-                reader.GetString(27)));
+                reader.GetString(27), reader.GetString(28), reader.GetString(29)));
         }
 
         return rows;
     }
 
-    /// <summary>The engine's hints for the whole queue - in one query, not row by row.</summary>
+    /// <summary>
+    /// The hints for the whole queue - the engine's and the model's - in one query, not row by row.
+    /// </summary>
+    /// <remarks>
+    /// The model's documents count only while its answer is about the contractor the transfer is
+    /// on now; after the engine has moved it to another, the service asks again.
+    /// </remarks>
     public async Task<IReadOnlyList<SuggestionRow>> GetSuggestionsAsync(
         DateTime from, CancellationToken token = default)
     {
         const string sql = """
             SELECT a.PaymentId, a.DocType, a.DocId, a.DocLp, a.DocNumber, a.Amount,
-                   a.Score, ISNULL(a.Reason, '') AS Reason
+                   a.Score, ISNULL(a.Reason, '') AS Reason, 0 AS Source
             FROM pay.Allocation AS a
             INNER JOIN pay.Payment AS p ON p.PaymentId = a.PaymentId
             INNER JOIN CDN.Zapisy AS z ON z.KAZ_GIDNumer = p.ErpEntryId
             WHERE p.PostingCategory = 'Standard'
               AND p.BookingDate >= @from
+
+            UNION ALL
+
+            SELECT a.PaymentId, a.DocType, a.DocId, a.DocLp, a.DocNumber, a.Amount,
+                   CAST(0 AS DECIMAL(5,3)), a.Reason, 1
+            FROM pay.AdvisorAllocation AS a
+            INNER JOIN pay.AdvisorReview AS r ON r.PaymentId = a.PaymentId AND r.Status = 'Done'
+            INNER JOIN pay.Payment AS p ON p.PaymentId = a.PaymentId AND p.ContractorId = r.ContractorId
+            INNER JOIN CDN.Zapisy AS z ON z.KAZ_GIDNumer = p.ErpEntryId
+            WHERE p.BookingDate >= @from
             """;
 
         var rows = new List<SuggestionRow>();
@@ -339,7 +362,8 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
         {
             rows.Add(new SuggestionRow(
                 reader.GetInt64(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetInt32(3),
-                reader.GetString(4), reader.GetDecimal(5), (double)reader.GetDecimal(6), reader.GetString(7)));
+                reader.GetString(4), reader.GetDecimal(5), (double)reader.GetDecimal(6), reader.GetString(7),
+                reader.GetInt32(8) == 1 ? SuggestionSource.Advisor : SuggestionSource.Service));
         }
 
         return rows;
@@ -375,6 +399,68 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
             """;
 
         return ReadDocumentsAsync(sql, token, ("@knt", contractorId), ("@currency", currency.Trim()));
+    }
+
+    /// <summary>
+    /// The open documents whose payment notes carry a card terminal's transaction number.
+    /// </summary>
+    /// <remarks>
+    /// How a card payment is tied to what it paid for: the cashier writes the number the terminal
+    /// printed into the payment's notes. Found this way whoever the document is made out to, the
+    /// one-off customer included - who is contractor 0, and so beyond the ordinary lookup. Only
+    /// the sales documents and their corrections: purchase invoices paid with a company card
+    /// carry numbers in their notes too.
+    /// </remarks>
+    public Task<IReadOnlyList<DocumentRow>> GetDocumentsByCardNumberAsync(
+        string transactionNumber, string currency, CancellationToken token = default)
+    {
+        var sql = $$"""
+            {{DocumentSelect}}
+              AND pl.TrP_GIDTyp IN (2033, 2034, 2037, 2041, 2042, 2045)
+              AND RTRIM(pl.TrP_Notatki) = @note
+              AND pl.TrP_Rozliczona IN (0, 2)
+              AND pl.TrP_Pozostaje > 0
+              AND (@currency = '' OR RTRIM(pl.TrP_Waluta) = @currency)
+            ORDER BY pl.TrP_Termin, pl.TrP_GIDNumer
+            """;
+
+        return ReadDocumentsAsync(sql, token, ("@note", transactionNumber.Trim()), ("@currency", currency.Trim()));
+    }
+
+    /// <summary>
+    /// The given document payments, while they are still open and in the transfer's currency.
+    /// </summary>
+    /// <remarks>
+    /// For the documents the model names that are not among the contractor's own - a receipt on
+    /// the one-off customer, an invoice made out to a related company. They are looked up by the
+    /// key the model gave, so they reach the list whoever they are made out to.
+    /// </remarks>
+    public Task<IReadOnlyList<DocumentRow>> GetDocumentsByKeysAsync(
+        IReadOnlyList<(int DocType, int DocId, int DocLp)> keys, string currency, CancellationToken token = default)
+    {
+        if (keys.Count == 0) return Task.FromResult<IReadOnlyList<DocumentRow>>([]);
+
+        var parameters = new List<(string Name, object Value)> { ("@currency", currency.Trim()) };
+        var conditions = new List<string>();
+
+        for (var i = 0; i < keys.Count; i++)
+        {
+            conditions.Add($"(pl.TrP_GIDTyp = @t{i} AND pl.TrP_GIDNumer = @n{i} AND pl.TrP_GIDLp = @l{i})");
+            parameters.Add(($"@t{i}", keys[i].DocType));
+            parameters.Add(($"@n{i}", keys[i].DocId));
+            parameters.Add(($"@l{i}", keys[i].DocLp));
+        }
+
+        var sql = $$"""
+            {{DocumentSelect}}
+              AND ({{string.Join(" OR ", conditions)}})
+              AND pl.TrP_Rozliczona IN (0, 2)
+              AND pl.TrP_Pozostaje > 0
+              AND (@currency = '' OR RTRIM(pl.TrP_Waluta) = @currency)
+            ORDER BY pl.TrP_Termin, pl.TrP_GIDNumer
+            """;
+
+        return ReadDocumentsAsync(sql, token, [.. parameters]);
     }
 
     private async Task<IReadOnlyList<DocumentRow>> ReadDocumentsAsync(
@@ -822,15 +908,15 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
     public async Task<IReadOnlySet<(int ContractorId, string Account)>> ContractorsWithAccountAsync(
         IReadOnlyList<(int ContractorId, string Account)> pairs, CancellationToken token = default)
     {
-        // Archived accounts count here, and only here. The question this answers is not "whose
-        // account is this" but "is this number already on the card" - and XLNowyRachunek refuses a
-        // number that is there, archived or not. Filtering them out would show the operator an
-        // "add account" button that fails every time they press it.
-        const string sql = """
+        // Archived accounts do not count: the service does not recognise a payer by them, so the
+        // "add account" button is exactly what the operator needs there - and pressing it brings
+        // the archived entry back rather than adding a second one, which XLNowyRachunek refuses.
+        var sql = $"""
             SELECT COUNT(*)
             FROM CDN.RachunkiBankowe
             WHERE RkB_ObiTyp = 32
               AND RkB_ObiNumer = @knt
+              AND {BankAccountSql.InUse}
               AND REPLACE(RTRIM(RkB_NrRachunku), ' ', '') IN (@pelny, @bezKraju)
             """;
 

@@ -235,7 +235,11 @@ public sealed class CodPipeline(
     private async Task<CodSummary> SettleWaitingAsync(
         int runId, CodSummary summary, CancellationToken cancellationToken)
     {
-        var pending = await store.GetPendingAsync(cancellationToken);
+        // Only the couriers' own formats: the card terminal's reports wait in the same table.
+        var pending = (await store.GetPendingAsync(cancellationToken))
+            .Where(r => _readers.Any(reader => reader.Format == r.Format))
+            .ToList();
+
         if (pending.Count == 0) return summary;
 
         using var step = TimedOperation.Trace(

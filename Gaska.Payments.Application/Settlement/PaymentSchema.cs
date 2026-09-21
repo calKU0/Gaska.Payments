@@ -189,6 +189,13 @@ public static class PaymentSchema
         IF COL_LENGTH('pay.Payment', 'CodPayoutEntryId') IS NULL
             ALTER TABLE pay.Payment ADD CodPayoutEntryId INT NULL;
 
+        -- The terminal batch a card payment was sent in, as "point/batch" - 73346135/109. Fiserv
+        -- pays batch by batch, so this is what a transfer from it is paired with, and the column
+        -- above then holds that transfer: on a card payment it means the batch's commission is
+        -- booked, as on a parcel it means the parcel's transfer is set aside.
+        IF COL_LENGTH('pay.Payment', 'CardBatch') IS NULL
+            ALTER TABLE pay.Payment ADD CardBatch VARCHAR(40) NULL;
+
         IF COL_LENGTH('pay.Payment', 'EndToEndId') IS NULL
             ALTER TABLE pay.Payment ADD EndToEndId NVARCHAR(64) NULL;
 
@@ -293,6 +300,48 @@ public static class PaymentSchema
         -- only once every parcel of the report has been settled in the COD register.
         IF COL_LENGTH('pay.CourierReport', 'PayoutClosedAt') IS NULL
             ALTER TABLE pay.CourierReport ADD PayoutClosedAt DATETIME2(0) NULL;
+
+        -- The language model's second opinion on the transfers the engine could not settle: one
+        -- row per transfer asked about, with the model's reasoning, and the documents it named.
+        -- Kept apart from pay.Allocation, which the engine rewrites every cycle.
+        --   Running - asked, the answer not back yet
+        --   Done    - answered; ContractorId says whose documents the answer was about
+        --   Failed  - no usable answer; tried again from NextAttemptAt, up to a limit
+        IF OBJECT_ID('pay.AdvisorReview', 'U') IS NULL
+        BEGIN
+            CREATE TABLE pay.AdvisorReview
+            (
+                PaymentId     BIGINT          NOT NULL CONSTRAINT PK_AdvisorReview PRIMARY KEY,
+                ContractorId  INT             NOT NULL,
+                Status        VARCHAR(12)     NOT NULL,
+                Attempts      INT             NOT NULL,
+                RequestedAt   DATETIME2(0)    NOT NULL,
+                AnsweredAt    DATETIME2(0)    NULL,
+                NextAttemptAt DATETIME2(0)    NULL,
+                Summary       NVARCHAR(MAX)   NULL,
+                Answer        NVARCHAR(MAX)   NULL,
+                Error         NVARCHAR(1000)  NULL,
+                CONSTRAINT FK_AdvisorReview_Payment FOREIGN KEY (PaymentId)
+                    REFERENCES pay.Payment (PaymentId) ON DELETE CASCADE
+            );
+        END;
+
+        IF OBJECT_ID('pay.AdvisorAllocation', 'U') IS NULL
+        BEGIN
+            CREATE TABLE pay.AdvisorAllocation
+            (
+                PaymentId BIGINT          NOT NULL,
+                DocType   INT             NOT NULL,
+                DocId     INT             NOT NULL,
+                DocLp     INT             NOT NULL,
+                DocNumber VARCHAR(50)     NOT NULL,
+                Amount    DECIMAL(19,2)   NOT NULL,
+                Reason    NVARCHAR(1000)  NOT NULL,
+                CONSTRAINT PK_AdvisorAllocation PRIMARY KEY (PaymentId, DocType, DocId, DocLp),
+                CONSTRAINT FK_AdvisorAllocation_Review FOREIGN KEY (PaymentId)
+                    REFERENCES pay.AdvisorReview (PaymentId) ON DELETE CASCADE
+            );
+        END;
         """;
 
     /// <summary>

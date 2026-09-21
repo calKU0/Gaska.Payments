@@ -1,11 +1,15 @@
-﻿using Gaska.Payments.Application.Couriers;
+﻿using Gaska.Payments.Application.Advisor;
+using Gaska.Payments.Application.Cards;
+using Gaska.Payments.Application.Couriers;
 using Gaska.Payments.Application.Settlement;
 using Gaska.Payments.Domain.Couriers;
 using Gaska.Payments.Domain.Matching;
 using Gaska.Payments.Domain;
 using Gaska.Payments.Erp;
+using Gaska.Payments.Integrations.Advisor;
 using Gaska.Payments.Integrations.Archive;
 using Gaska.Payments.Integrations.Bank;
+using Gaska.Payments.Integrations.Cards;
 using Gaska.Payments.Integrations.Couriers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -88,6 +92,34 @@ public static class DependencyInjection
         services.AddSingleton<CodNotifier>();
         services.AddSingleton<ShipmentReader>();
         services.AddSingleton<CodPipeline>();
+
+        // The card terminal: Fiserv's reports from the same mailbox, booked on KARTA.
+        services.AddOptions<CardOptions>().Bind(configuration.GetSection(CardOptions.SectionName));
+        services.AddSingleton<FiservReportReader>();
+        services.AddSingleton<CardStore>();
+        services.AddSingleton<CardPipeline>();
+
+        services.AddSingleton<SchemaGate>();
+
+        // The language model's second opinion on what the engine could not settle. The client is
+        // made only when the advisor is on - with it off, an empty address is no error.
+        services.AddOptions<AdvisorOptions>()
+            .Bind(configuration.GetSection(AdvisorOptions.SectionName))
+            .Validate(o => !o.Enabled || Uri.TryCreate(o.Url, UriKind.Absolute, out _),
+                "Advisor:Url musi być pełnym adresem, gdy Advisor:Enabled jest włączone.")
+            .Validate(o => o.TimeoutMinutes > 0 && o.MaxAttempts > 0,
+                "Advisor:TimeoutMinutes i Advisor:MaxAttempts muszą być dodatnie.")
+            .ValidateOnStart();
+
+        services.AddSingleton<AdvisorStore>();
+        services.AddSingleton(sp =>
+        {
+            var advisor = sp.GetRequiredService<IOptions<AdvisorOptions>>().Value;
+
+            return new SettlementAdvisorClient(
+                new HttpClient { Timeout = TimeSpan.FromMinutes(advisor.TimeoutMinutes) },
+                new Uri(advisor.Url));
+        });
 
         return services;
     }

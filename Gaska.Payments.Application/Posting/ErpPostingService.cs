@@ -1,7 +1,9 @@
+using Gaska.Payments.Application.Cards;
 using Gaska.Payments.Application.Couriers;
 using Gaska.Payments.Application.Settlement;
 using Gaska.Payments.Domain.Couriers;
 using Gaska.Payments.Domain.Diagnostics;
+using Gaska.Payments.Domain.Model;
 using Gaska.Payments.Erp;
 using Gaska.Payments.Integrations.Couriers;
 using Microsoft.Extensions.Logging;
@@ -30,6 +32,7 @@ public sealed class ErpPostingService(
     IOptions<XlOptions> options,
     IOptions<SettlementOptions> settlementOptions,
     IOptions<CodOptions> codOptions,
+    IOptions<CardOptions> cardOptions,
     ILogger<ErpPostingService> logger)
 {
     private const int ContractorGidType = 32;
@@ -44,19 +47,29 @@ public sealed class ErpPostingService(
     /// same, and the difference is made only by the operation category, which keeps them out of
     /// settlement.
     /// </summary>
-    private readonly IReadOnlyList<string> _registers = Registers(settlementOptions.Value, codOptions.Value);
+    private readonly IReadOnlyList<string> _registers =
+        Registers(settlementOptions.Value, codOptions.Value, cardOptions.Value);
 
     private readonly CodOptions _cod = codOptions.Value;
 
+    private readonly CardOperationSymbols _cardOperations = cardOptions.Value.Enabled
+        ? new(cardOptions.Value.SaleOperation, cardOptions.Value.RefundOperation, cardOptions.Value.FeeOperation)
+        : CardOperationSymbols.None;
+
     /// <summary>
-    /// The registers posted to: the bank ones, plus the cash on delivery register when it is
-    /// switched on. It is not in the <c>Settlement</c> lists because no statement is ever
-    /// downloaded for it - the money reaches it from the couriers' reports, not from the bank.
+    /// The registers posted to: the bank ones, plus the cash on delivery register and the card
+    /// terminal's when they are switched on. Neither is in the <c>Settlement</c> lists, because no
+    /// statement is ever downloaded for them - their money comes from reports, not from the bank.
     /// </summary>
-    private static IReadOnlyList<string> Registers(SettlementOptions settlement, CodOptions cod) =>
-        cod is { Enabled: true, Register.Length: > 0 }
-            ? [.. settlement.AllRegisters, cod.Register]
-            : settlement.AllRegisters;
+    private static IReadOnlyList<string> Registers(SettlementOptions settlement, CodOptions cod, CardOptions cards)
+    {
+        var registers = new List<string>(settlement.AllRegisters);
+
+        if (cod is { Enabled: true, Register.Length: > 0 }) registers.Add(cod.Register);
+        if (cards is { Enabled: true, Register.Length: > 0 }) registers.Add(cards.Register);
+
+        return [.. registers.Distinct(StringComparer.OrdinalIgnoreCase)];
+    }
 
     private readonly XlSettlementEngine _engine = new(logger);
 
@@ -88,7 +101,7 @@ public sealed class ErpPostingService(
 
         var operations = await repository.GetOperationsToPostAsync(
             _options.PostFrom, _registers, _options.MaxOperationsPerRun, _options.FeeOperation,
-            _cod.OperationSymbol, _options.ToBuffer, cancellationToken);
+            _cod.OperationSymbol, _options.ToBuffer, _cardOperations, cancellationToken);
 
         await ReportStrandedAsync(cancellationToken);
 
@@ -114,8 +127,11 @@ public sealed class ErpPostingService(
             allocations[paymentId] = await repository.GetAllocationsAsync(paymentId, cancellationToken);
         }
 
+        // Keyed by the report an entry goes into - its own day's, or its month's on KARTA.
         var existingReports = new HashSet<(string, DateTime)>();
-        foreach (var (series, day) in operations.Select(o => (o.RegisterSeries, o.BookingDate.Date)).Distinct())
+        foreach (var (series, day) in operations
+                     .Select(o => (o.RegisterSeries, PaymentCategory.ReportDay(o.PostingCategory, o.BookingDate)))
+                     .Distinct())
         {
             if (await repository.ReportExistsAsync(series, day, cancellationToken)) existingReports.Add((series, day));
         }
@@ -220,15 +236,23 @@ public sealed class ErpPostingService(
             journal.MarkPosted(operation.PaymentId, entryId.Value);
             posted++;
 
-            if (!IsReadyForAutomaticSettlement(operation) ||
-                !allocations.TryGetValue(operation.PaymentId, out var lines) || lines.Count == 0)
+            if (IsReadyForAutomaticSettlement(operation) &&
+                allocations.TryGetValue(operation.PaymentId, out var lines) && lines.Count > 0)
             {
-                continue;
+                if (Settle(session, journal, operation.PaymentId, entryId.Value, operation.Amount,
+                        operation.ContractorId, lines))
+                {
+                    settled++;
+                    continue;
+                }
+
+                failures++;
             }
 
-            if (Settle(session, journal, operation.PaymentId, entryId.Value, operation.Amount,
-                    operation.ContractorId, lines)) settled++;
-            else failures++;
+            // Left unsettled, but on a contractor we are sure of: the entry gets that contractor's
+            // account now, as a settlement would have given it. Fiserv's payout and its commission
+            // are never settled at all, and went without one until somebody typed it in.
+            if (operation.CarriesAccount) journal.UpdateEntryAccount(entryId.Value, operation.ErpContractorId);
         }
 
         // The backlog is closed in the same session - the same open items, only for entries
@@ -314,7 +338,9 @@ public sealed class ErpPostingService(
     {
         if (_options.ToBuffer) return 0;
 
-        var day = operation.BookingDate.Date;
+        // The report the entry belongs to: its own day's, or for the card terminal the month's,
+        // opened on the first. XL puts an entry dated the 12th into the month's report by itself.
+        var day = PaymentCategory.ReportDay(operation.PostingCategory, operation.BookingDate);
         if (!existingReports.Add((operation.RegisterSeries, day))) return 0;
 
         var report = new XLRaportInfo_20251
@@ -323,6 +349,11 @@ public sealed class ErpPostingService(
             Tryb = BatchMode,
             Kasa = operation.RegisterSeries,
             DataOtw = XlDate.FromDateTime(day),
+            // Opened at midnight, as the half-automat opened KARTA's. Left out, XL stamps the report
+            // with the time of day it was created, and then takes no entry of that day stamped any
+            // earlier: FORPL's report for 14 September, opened at 13:51, refused every entry of the
+            // 14th posted at 08:47 the next morning with 8158, "no report of that id".
+            DataCzasOtw = XlDate.Moment(day),
         };
 
         // The id the API hands back is its own handle on the new report, not KRP_GIDNumer, and it
@@ -373,12 +404,13 @@ public sealed class ErpPostingService(
             Operacja = operation.OperationSymbol,
             Data = XlDate.FromDateTime(operation.BookingDate),
             DataDok = XlDate.FromDateTime(operation.BookingDate),
+            DataCzas = EntryMoment(operation.BookingDate),
             Kwota = XlSession.Amount(operation.Amount),
             WalutaRoz = operation.Currency,
             Numer = Trim(operation.EntryNumber, 31),
             Tresc = Trim(operation.Description, 255),
             Opis = Trim(operation.PayerName, 255),
-            KNTTyp = operation.ErpContractorId != 0 ? ContractorGidType : 0,
+            KNTTyp = operation.NamesContractor ? ContractorGidType : 0,
             KNTNumer = operation.ErpContractorId,
             // NieRozliczaj is deliberately left unset - ERP takes the flag from the cash
             // operation's definition (KAO_NieRozliczaj), so setting it here would merely
@@ -413,6 +445,22 @@ public sealed class ErpPostingService(
     /// A debit can only be certain through an order reference returned by the bank: the engine
     /// does not match debits by title, so every certain debit names its document outright.
     /// </remarks>
+    /// <summary>
+    /// The date and time stamped on an entry: the last second of its day when the day is past,
+    /// otherwise left to XL.
+    /// </summary>
+    /// <remarks>
+    /// XL takes an entry into a report only if the entry is stamped no earlier than the report was
+    /// opened. Left to itself it stamps the entry with its own day and the current time, so an entry
+    /// for yesterday, posted this morning, falls before a report of yesterday's opened in the
+    /// afternoon - and is refused with 8158 until the clock passes that hour. The last second of the
+    /// day is after any opening on that day and before the next day's report, which is what makes
+    /// the entry belong where its date says. Today's entries keep XL's own stamp: that is now, and
+    /// no report of today can have been opened later than now.
+    /// </remarks>
+    private static int EntryMoment(DateTime bookingDate) =>
+        bookingDate.Date < DateTime.Today ? XlDate.Moment(bookingDate.Date.AddDays(1).AddSeconds(-1)) : 0;
+
     private static bool IsReadyForAutomaticSettlement(PendingOperation operation) =>
         operation is { Confidence: "High", Status: "Proposed" };
 

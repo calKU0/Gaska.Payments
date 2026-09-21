@@ -48,4 +48,31 @@ public static class PaymentCategory
     /// receipt, but it reaches us from a report rather than from a bank statement.
     /// </summary>
     public const string Cod = "Cod";
+
+    /// <summary>
+    /// A payment taken on our own card terminal, booked on KARTA from Fiserv's report and settled
+    /// against the receipt or invoice whose notes carry its transaction number. Not to be confused
+    /// with <see cref="Card"/>, which is spending on the company's own cards.
+    /// </summary>
+    public const string Polcard = "Polcard";
+
+    /// <summary>
+    /// Fiserv's commission on a batch of terminal payments: what the batch came to less what
+    /// Fiserv transferred for it. Booked on KARTA, never settled.
+    /// </summary>
+    public const string PolcardFee = "PolcardFee";
+
+    /// <summary>
+    /// Whether the entry goes into a report for the whole month rather than one for its day.
+    /// </summary>
+    /// <remarks>
+    /// KARTA has always kept one report a month, opened on the first, and the entries keep their
+    /// own days inside it. The bank registers keep a report a day. It is asked per entry because
+    /// only the card terminal's entries ever reach KARTA.
+    /// </remarks>
+    public static bool InMonthlyReport(string category) => category is Polcard or PolcardFee;
+
+    /// <summary>The day of the report an entry of this category belongs to.</summary>
+    public static DateTime ReportDay(string category, DateTime bookingDate) =>
+        InMonthlyReport(category) ? new DateTime(bookingDate.Year, bookingDate.Month, 1) : bookingDate.Date;
 }
