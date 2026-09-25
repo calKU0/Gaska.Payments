@@ -11,19 +11,59 @@ namespace Gaska.Payments.Desktop.ViewModels;
 /// or nobody.
 /// </summary>
 /// <param name="advice">The model's proposal for this document, or null when it named none.</param>
+/// <param name="selected">
+/// Whether it arrives ticked. Decided outside, because which proposal to tick - the engine's or
+/// the model's - is a question about the whole transfer, not about one document.
+/// </param>
+/// <param name="settledWithPayment">
+/// The transfer in hand already settled this document in ERP. Such a document arrives ticked and
+/// stays that way: the tick is a record of what happened, not an instruction.
+/// </param>
 public sealed class DocumentItem(
-    DocumentRow row, bool suggested, SuggestionRow? advice, bool paymentIsIncoming) : ObservableObject
+    DocumentRow row,
+    bool suggested,
+    SuggestionRow? advice,
+    bool paymentIsIncoming,
+    bool selected,
+    bool settledWithPayment = false) : ObservableObject
 {
     // A hint on a payment somebody has since flagged "nie rozliczaj" is stale: the badge still
     // says the service matched it, but it does not arrive ticked - settling it would undo a
-    // decision already made in ERP. The model's documents never arrive ticked: it is a second
-    // opinion for the accountant to weigh, not a match.
-    private bool _isSelected = suggested && !row.DoNotSettle;
+    // decision already made in ERP.
+    private bool _isSelected = settledWithPayment || (selected && !row.DoNotSettle);
 
     public DocumentRow Row { get; } = row;
 
     /// <summary>The matching engine assigned this document to the transfer.</summary>
     public bool IsSuggested { get; } = suggested;
+
+    /// <summary>This transfer's settlement of the document, as it stands in ERP.</summary>
+    public bool IsSettledWithPayment { get; } = settledWithPayment;
+
+    /// <summary>
+    /// Nothing is left open on the document - it has been settled, here or elsewhere.
+    /// </summary>
+    /// <remarks>
+    /// Both halves are asked, because ERP writes them at different moments: the flag says the
+    /// payment is closed, and the remaining amount says how much of it is. A payment left at
+    /// nought with the flag still off would otherwise count as an open item and offer a tick that
+    /// XL refuses.
+    /// </remarks>
+    public bool IsSettled => Row.SettlementFlag == 1 || Row.Remaining <= 0.004m;
+
+    /// <summary>
+    /// Whether this transfer can still be settled against the document.
+    /// </summary>
+    /// <remarks>
+    /// It cannot once the document is closed or flagged "nie rozliczaj" - XL refuses both - so the
+    /// tick is disabled rather than left to fail at the far end. The totals underneath and the
+    /// settlement itself count only what this allows, which is why a document settled by this very
+    /// transfer can sit on the list ticked and change nothing.
+    /// </remarks>
+    public bool CanSettle => !IsSettled && !DoNotSettle;
+
+    /// <summary>Whether ERP's "nie rozliczaj" box may still be set - a closed payment has nothing to flag.</summary>
+    public bool CanFlag => !IsSettled;
 
     /// <summary>The language model proposed this document.</summary>
     public bool IsAdvised => advice is not null;
@@ -60,6 +100,7 @@ public sealed class DocumentItem(
             if (value) IsSelected = false;
 
             Raise(nameof(SettlementState));
+            Raise(nameof(CanSettle));
             DoNotSettleChanged?.Invoke(this);
         }
     }
@@ -73,6 +114,7 @@ public sealed class DocumentItem(
         _doNotSettle = value;
         Raise(nameof(DoNotSettle));
         Raise(nameof(SettlementState));
+        Raise(nameof(CanSettle));
     }
 
     public string DocNumber => Row.DocNumber;
@@ -80,14 +122,12 @@ public sealed class DocumentItem(
     public string Kind => Row.IsLiability ? "zobowiązanie" : "należność";
 
     /// <summary>
-    /// How far this open item is settled, in the same words the queue uses.
+    /// How far this document is settled, in the same words the queue uses. It is what the state
+    /// filter over the list reads.
     /// </summary>
-    /// <remarks>
-    /// Fully settled payments are never loaded (they have nothing left on them), so only three of
-    /// the four states can occur here.
-    /// </remarks>
     public SettlementState SettlementState =>
         DoNotSettle ? Data.SettlementState.DoNotSettle
+        : IsSettled ? Data.SettlementState.Settled
         : Row.Remaining < Row.Amount - 0.004m ? Data.SettlementState.Partial
         : Data.SettlementState.Unsettled;
 
@@ -471,10 +511,14 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
 
         // Assigned to the field, not through the property: the property refuses to be emptied,
         // which is what stops the drop-down clobbering it, and here the model itself is deciding.
+        //
+        // What is on the entry wins over the contractor's commonest account even when the picker
+        // does not offer it. Somebody typed it there - the accountant in ERP, or a settlement of
+        // ours - and replacing it with a statistic would hide that, on the list and in the picker
+        // alike.
         _selectedAccount =
             accounts.FirstOrDefault(a => string.Equals(a, ours, StringComparison.OrdinalIgnoreCase))
-            ?? accounts.FirstOrDefault()
-            ?? (ours.Length > 0 ? ours : null);
+            ?? (ours.Length > 0 ? ours : accounts.FirstOrDefault());
 
         Raise(nameof(SelectedAccount));
         Raise(nameof(ContractorAccounts));
@@ -600,8 +644,14 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
         _ => "brak dopasowania",
     };
 
-    /// <summary>How many of the service's hints still stand (the document is still open).</summary>
-    public IReadOnlyList<DocumentItem> Selected => [.. Documents.Where(d => d.IsSelected)];
+    /// <summary>
+    /// The documents this transfer is to be settled against.
+    /// </summary>
+    /// <remarks>
+    /// A tick alone is not enough: documents this transfer has already settled arrive ticked, as a
+    /// record of what ERP holds, and sending them to XL a second time would only earn an error.
+    /// </remarks>
+    public IReadOnlyList<DocumentItem> Selected => [.. Documents.Where(d => d.IsSelected && d.CanSettle)];
 
     /// <summary>
     /// Ticked documents whose currency differs from the transfer's.
@@ -615,12 +665,12 @@ public sealed class PaymentItem(PaymentRow row) : ObservableObject
 
     // Summed over Row.Remaining rather than DocumentItem.Remaining: the latter already carries
     // the side's sign and the total would come out at zero where it should show a difference.
-    public decimal SelectedInvoices => Documents
-        .Where(d => d.IsSelected && !d.Row.IsLiability)
+    public decimal SelectedInvoices => Selected
+        .Where(d => !d.Row.IsLiability)
         .Sum(d => d.Row.Remaining);
 
-    public decimal SelectedLiabilities => Documents
-        .Where(d => d.IsSelected && d.Row.IsLiability)
+    public decimal SelectedLiabilities => Selected
+        .Where(d => d.Row.IsLiability)
         .Sum(d => d.Row.Remaining);
 
     /// <summary>

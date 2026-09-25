@@ -639,7 +639,7 @@
                                                       Header="{Binding DocumentStateFilterSummary}"
                                                       ItemsSource="{Binding DocumentStateFilters}"
                                                       ItemTemplate="{StaticResource FilterEntry}"
-                                                      ToolTip="Ten sam filtr co nad kolejką. Płatności z zaznaczonym w ERP „nie rozliczaj” są domyślnie ukryte." />
+                                                      ToolTip="Ten sam filtr co nad kolejką. „Rozliczone” to dokumenty rozliczone tym przelewem – przy przelewie rozliczonym widać je od razu." />
                             </StackPanel>
                         </WrapPanel>
 
@@ -651,10 +651,17 @@
                                   ScrollViewer.VerticalScrollBarVisibility="Auto"
                                   ItemsSource="{Binding DocumentsView}" RowHeight="32">
                             <DataGrid.Columns>
+                                <!--
+                                    Zaznaczenie gasnie na dokumentach, których nie da się
+                                    rozliczyć: już rozliczonych i tych z „nie rozliczaj”. Te, które
+                                    rozliczył ten przelew, przychodzą zaznaczone - to zapis tego,
+                                    co jest w ERP, a nie polecenie.
+                                -->
                                 <DataGridTemplateColumn Width="44" MinWidth="44" CanUserSort="False">
                                     <DataGridTemplateColumn.CellTemplate>
                                         <DataTemplate>
                                             <CheckBox IsChecked="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}"
+                                                      IsEnabled="{Binding CanSettle}"
                                                       HorizontalAlignment="Center" VerticalAlignment="Center" />
                                         </DataTemplate>
                                     </DataGridTemplateColumn.CellTemplate>
@@ -673,6 +680,7 @@
                                     <DataGridTemplateColumn.CellTemplate>
                                         <DataTemplate>
                                             <CheckBox IsChecked="{Binding DoNotSettle, UpdateSourceTrigger=PropertyChanged}"
+                                                      IsEnabled="{Binding CanFlag}"
                                                       HorizontalAlignment="Center" VerticalAlignment="Center"
                                                       ToolTip="Ustawia w ERP „nie rozliczaj” na tej płatności. Zaznaczenie zdejmuje dokument z rozliczanych." />
                                         </DataTemplate>
@@ -705,8 +713,12 @@
                                 <!--
                                     Kto zaproponował dokument. Serwis - silnik dopasowania, jego
                                     dokumenty przychodzą zaznaczone. AI - model pytany o przelewy,
-                                    z którymi serwis sobie nie poradził; nigdy nie zaznacza, tylko
-                                    podpowiada, a w dymku mówi, ile i dlaczego.
+                                    z którymi serwis sobie nie poradził; w dymku mówi, ile i
+                                    dlaczego. Zaznaczone są dokumenty AI tylko wtedy, gdy zamykają
+                                    przelew co do grosza, a serwis wskazał co innego.
+
+                                    Trzeci znacznik to nie podpowiedź, tylko stan z ERP: tym
+                                    dokumentem ten przelew jest już rozliczony.
                                 -->
                                 <DataGridTemplateColumn Header="Podpowiedział" Width="*" MinWidth="124">
                                     <DataGridTemplateColumn.CellTemplate>
@@ -723,6 +735,12 @@
                                                         Visibility="{Binding IsAdvised, Converter={StaticResource BoolToVisibility}}">
                                                     <TextBlock Text="AI" Style="{StaticResource BadgeText}"
                                                                Foreground="{StaticResource Advisor}" />
+                                                </Border>
+                                                <Border Style="{StaticResource Badge}" Background="{StaticResource GoodSoft}" Margin="6,0,0,0"
+                                                        ToolTip="Ten przelew jest już rozliczony z tym dokumentem w ERP."
+                                                        Visibility="{Binding IsSettledWithPayment, Converter={StaticResource BoolToVisibility}}">
+                                                    <TextBlock Text="Rozliczone" Style="{StaticResource BadgeText}"
+                                                               Foreground="{StaticResource Good}" />
                                                 </Border>
                                             </StackPanel>
                                         </DataTemplate>

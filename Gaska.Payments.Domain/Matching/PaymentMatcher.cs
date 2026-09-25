@@ -21,10 +21,10 @@ namespace Gaska.Payments.Domain.Matching;
 public sealed class PaymentMatcher(MatchingOptions? options = null)
 {
     /// <summary>
-    /// Lowest score a document reference may have on a part payment. It corresponds to a hit
-    /// through a related document number - anything weaker is a bare number with no context.
+    /// How much of a document's remaining amount may be left unpaid before the payment counts as
+    /// a part payment. A grosz of difference is rounding, not an instalment.
     /// </summary>
-    private const double PartialPaymentMinimumScore = 0.80;
+    private const decimal PartialPaymentTolerance = 0.004m;
 
     private readonly MatchingOptions _options = options ?? new MatchingOptions();
     private readonly DescriptionParser _parser = new(options);
@@ -38,7 +38,7 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
         // names the document directly, so there is no point reading the title or guessing the
         // contractor.
         var byReference = MatchByBankReference(payment, index);
-        if (byReference is not null) return byReference;
+        if (byReference is not null) return CapPartialPayment(byReference);
 
 
         var parsed = _parser.Parse(payment.Description);
@@ -113,7 +113,7 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
 
         var confidence = ApplyBankAccountRequirement(result.Confidence, contractor.FromBankAccount, notes);
 
-        return new MatchResult
+        return CapPartialPayment(new MatchResult
         {
             Payment = payment,
             Confidence = confidence,
@@ -125,7 +125,7 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
             References = parsed.References,
             Unallocated = payment.AmountToAllocate - result.Allocations.Sum(a => a.Amount),
             Notes = notes,
-        };
+        });
     }
 
     /// <summary>
@@ -196,6 +196,44 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
             ContractorFromBankAccount = fromAccount,
             Unallocated = amount - covered,
             Notes = notes,
+        };
+    }
+
+    /// <summary>
+    /// Takes the automat off a proposal that would leave a document half paid.
+    /// </summary>
+    /// <remarks>
+    /// An amount agreeing to the penny is what makes a match certain; an amount smaller than the
+    /// document it names confirms nothing. The customer may have deducted a correction, settled
+    /// an instalment, or held back what they dispute - and which of those it is decides what
+    /// should be settled against what. So the proposal stands and the accountant sees it, but
+    /// nothing is posted without them.
+    ///
+    /// <see cref="TopUpFromContractor"/> runs first and often removes the question altogether:
+    /// where the difference is a correction open on the same card, the transfer is not a part
+    /// payment at all.
+    /// </remarks>
+    private static MatchResult CapPartialPayment(MatchResult result)
+    {
+        if (result.Confidence != MatchConfidence.High) return result;
+
+        // The absolute value, because a correction enters the proposal with a minus in front of
+        // it while its remaining amount is a positive figure.
+        var partial = result.Allocations
+            .Where(a => Math.Abs(a.Amount) < a.Receivable.Remaining - PartialPaymentTolerance)
+            .ToList();
+
+        if (partial.Count == 0) return result;
+
+        var documents = string.Join(", ", partial.Take(3).Select(
+            a => $"{a.Receivable.DocumentNumber} ({Math.Abs(a.Amount):N2} z {a.Receivable.Remaining:N2})"));
+
+        return result with
+        {
+            Confidence = MatchConfidence.Medium,
+            Notes = [.. result.Notes,
+                $"{Kind(result.Payment.IsIncoming)} nie pokrywa dokumentu w całości: {documents} – " +
+                "nie rozliczam tego automatycznie, bo klient mógł odjąć korektę albo zapłacić ratę."],
         };
     }
 
@@ -555,25 +593,30 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
                 MatchConfidence.Medium, MatchStrategy.ExplicitReferencesRounding, allocations);
         }
 
-        // 3. One named document, the payment covering part of it - common with instalments.
+        // 3. One named document and the transfer does not cover it. Before calling that a part
+        //    payment we look for what would make up the difference among the contractor's other
+        //    open items: an underpayment is as often a correction the customer deducted without
+        //    saying so, and settling the invoice against that correction is what actually
+        //    happened.
         if (explicitHits.Count == 1)
         {
             var only = explicitHits[0];
             if (!only.Receivable.IsCorrection && target < only.Receivable.Remaining - tolerance)
             {
+                var balanced = TopUpFromContractor(
+                    payment, index, contractorId, explicitHits, target, signedSum, tolerance, notes);
+
+                if (balanced is not null) return balanced;
+
                 notes.Add($"{Kind(payment.IsIncoming)} częściowa: {target:N2} " +
                           $"z {only.Receivable.Remaining:N2} {only.Receivable.Currency}.");
 
-                // On a part payment the amount confirms nothing, so all that counts is
-                // whether the document was named unambiguously. It makes no difference whether
-                // the customer quoted the invoice number or that of the order it came from - in
-                // both cases the reference leads to exactly one open document of that contractor.
-                // What does drop out is a bare number with no context at all (0.75).
-                var confidence = only.Reliable && only.Score >= PartialPaymentMinimumScore
-                    ? MatchConfidence.High
-                    : MatchConfidence.Medium;
+                // Never certain, whatever the title said - see CapPartialPayment. The document
+                // was named unambiguously, but nothing here says the customer meant to leave the
+                // rest of it open, and part-paying an invoice they consider settled is the one
+                // outcome the accountant cannot spot by reading the list afterwards.
                 return new AllocationOutcome(
-                    confidence,
+                    MatchConfidence.Medium,
                     MatchStrategy.SingleDocumentPartialPayment,
                     [new MatchAllocation(
                         only.Receivable, target, only.Score,
@@ -605,44 +648,10 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
         }
 
         // 5. The named documents plus further open items of the contractor to make up the rest.
-        if (contractorId != 0)
-        {
-            var missing = target - signedSum;
-            var pool = BuildPool(index, contractorId, payment.Currency)
-                .Where(r => explicitHits.All(h => !ReferenceEquals(h.Receivable, r)))
-                .ToList();
+        var toppedUp = TopUpFromContractor(
+            payment, index, contractorId, explicitHits, target, signedSum, tolerance, notes);
 
-            if (Math.Abs(missing) > tolerance && pool.Count > 0)
-            {
-                var extra = SelectSubset(pool, missing, tolerance, out var solutionCount);
-
-                // We top up with missing documents only when exactly one set fits. With
-                // several possible sets the choice is a coin toss - better to propose just the
-                // documents named in the title (point 6) than to bolt guessed ones onto them.
-                if (extra is not null && solutionCount == 1)
-                {
-                    var allocations = explicitHits
-                        .Select(h => new MatchAllocation(h.Receivable, h.Receivable.SignedRemaining, h.Score, h.Reason))
-                        .Concat(extra.Select(r => new MatchAllocation(
-                            r, r.SignedRemaining, 0.50,
-                            $"dobrane, żeby zbilansować kwotę {KindOf(payment.IsIncoming)}")))
-                        .ToList();
-
-                    notes.Add($"Dokumenty z tytułu nie pokrywały całej {KindOf(payment.IsIncoming)} – " +
-                              $"resztę dobrano z {SideOf(payment.IsIncoming)} kontrahenta.");
-                    return new AllocationOutcome(
-                        MatchConfidence.Medium,
-                        MatchStrategy.ReferencesExtendedBySubsetSum,
-                        allocations);
-                }
-
-                if (extra is not null)
-                {
-                    notes.Add($"Brakującą część {KindOf(payment.IsIncoming)} dałoby się pokryć " +
-                              $"na {solutionCount} różnych sposobów – nie zgaduję, które dokumenty dobrać.");
-                }
-            }
-        }
+        if (toppedUp is not null) return toppedUp;
 
         // 6. Nothing balances - spread the amount over the named documents, oldest first, with the
         //    corrections named alongside them netted off first. A correction the customer quoted
@@ -677,6 +686,65 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// The documents named in the title topped up with further open items of the contractor, so
+    /// that the sum comes to the amount. Null when nothing fits - or when several sets do.
+    /// </summary>
+    /// <remarks>
+    /// The difference may be of either sign: a transfer larger than the documents named leaves
+    /// something to find, and one smaller than them is usually a correction the customer deducted
+    /// in silence, which the search finds because corrections enter the sum with a minus.
+    ///
+    /// Only ever when exactly one set fits. With several the choice is a coin toss, and proposing
+    /// just the documents from the title is the better answer than bolting guessed ones onto them.
+    /// </remarks>
+    private AllocationOutcome? TopUpFromContractor(
+        BankPayment payment,
+        DocumentIndex index,
+        int contractorId,
+        List<ReferenceHit> explicitHits,
+        decimal target,
+        decimal signedSum,
+        decimal tolerance,
+        List<string> notes)
+    {
+        if (contractorId == 0) return null;
+
+        var missing = target - signedSum;
+        if (Math.Abs(missing) <= tolerance) return null;
+
+        var pool = BuildPool(index, contractorId, payment.Currency)
+            .Where(r => explicitHits.All(h => !ReferenceEquals(h.Receivable, r)))
+            .ToList();
+
+        if (pool.Count == 0) return null;
+
+        var extra = SelectSubset(pool, missing, tolerance, out var solutionCount);
+        if (extra is null) return null;
+
+        if (solutionCount > 1)
+        {
+            notes.Add($"Brakującą część {KindOf(payment.IsIncoming)} dałoby się pokryć " +
+                      $"na {solutionCount} różnych sposobów – nie zgaduję, które dokumenty dobrać.");
+            return null;
+        }
+
+        var allocations = explicitHits
+            .Select(h => new MatchAllocation(h.Receivable, h.Receivable.SignedRemaining, h.Score, h.Reason))
+            .Concat(extra.Select(r => new MatchAllocation(
+                r, r.SignedRemaining, 0.50,
+                $"dobrane, żeby zbilansować kwotę {KindOf(payment.IsIncoming)}")))
+            .ToList();
+
+        notes.Add($"Dokumenty z tytułu nie pokrywały całej {KindOf(payment.IsIncoming)} – " +
+                  $"resztę dobrano z {SideOf(payment.IsIncoming)} kontrahenta.");
+
+        return new AllocationOutcome(
+            MatchConfidence.Medium,
+            MatchStrategy.ReferencesExtendedBySubsetSum,
+            allocations);
     }
 
     private AllocationOutcome? AllocateFromContractorPool(

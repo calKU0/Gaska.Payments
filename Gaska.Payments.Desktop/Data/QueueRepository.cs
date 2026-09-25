@@ -190,6 +190,31 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
     /// </remarks>
     public const string HasWorkSql = "KAZ_Rozliczony = 0 AND KAZ_Pozostaje > 0.004";
 
+    /// <summary>
+    /// The contractor the transfer belongs to: the one on the ERP entry when somebody has put one
+    /// there, otherwise the one the service matched.
+    /// </summary>
+    /// <remarks>
+    /// The entry comes first because a party on it is a decision somebody made - accounting sets
+    /// contractors in ERP as readily as in this application, and until now that work was invisible
+    /// here: the queue read the service's own column and showed "nierozpoznany" over an entry that
+    /// named its contractor plainly.
+    ///
+    /// The party counts only when it really is a contractor. A tax return is booked against an
+    /// office (KAZ_KNTTyp 4304) and a payroll against an employee (944), and those numbers come
+    /// from sequences of their own - the II Urząd Skarbowy is number 4, which is also the
+    /// contractor with acronym "0002". Joined on the number alone, 2183 entries on this register
+    /// showed somebody else's card.
+    /// </remarks>
+    private const string QueueContractorSql = """
+        CASE WHEN z.KAZ_KNTTyp = 32 AND z.KAZ_KntNumer <> 0 THEN z.KAZ_KntNumer
+             ELSE ISNULL(p.ContractorId, 0) END
+        """;
+
+    /// <summary>Whether that contractor is the entry's own rather than the service's.</summary>
+    private const string ContractorFromEntrySql =
+        "z.KAZ_KNTTyp = 32 AND z.KAZ_KntNumer <> 0 AND z.KAZ_KntNumer <> ISNULL(p.ContractorId, 0)";
+
     public async Task<IReadOnlyList<PaymentRow>> GetQueueAsync(
         DateTime from, bool withHistory, CancellationToken token = default)
     {
@@ -212,18 +237,19 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                    ISNULL(p.PayerAccount, '')                             AS PayerAccount,
                    ISNULL(p.Description, RTRIM(ISNULL(z.KAZ_Tresc, '')))  AS Description,
                    ISNULL(p.Confidence, 'None')                           AS Confidence,
-                   -- The party on the entry counts only when it really is a contractor. A tax
-                   -- return is booked against an office (KAZ_KNTTyp 4304) and a payroll against
-                   -- an employee (944), and those numbers come from sequences of their own - the
-                   -- II Urząd Skarbowy is number 4, which is also the contractor with acronym
-                   -- "0002". Joined on the number alone, 2183 entries on this register showed
-                   -- somebody else's card.
-                   ISNULL(p.ContractorId,
-                          CASE WHEN z.KAZ_KNTTyp = 32 THEN z.KAZ_KntNumer ELSE 0 END) AS ContractorId,
+                   -- Whoever the entry is booked against beats the service's own guess - see
+                   -- QueueContractorSql.
+                   {QueueContractorSql} AS ContractorId,
                    ISNULL(RTRIM(k.Knt_Akronim), '')       AS ContractorAcronym,
                    ISNULL(RTRIM(k.Knt_Nazwa1), '')        AS ContractorName,
-                   ISNULL(p.ContractorSource, '')         AS ContractorSource,
-                   ISNULL(p.ContractorFromBankAccount, CONVERT(BIT, 0)) AS ContractorFromBankAccount,
+                   -- How we know the contractor. A party somebody entered in ERP is evidence of
+                   -- its own, and it says nothing about the payer's bank account, so the flag that
+                   -- would let the service settle on its own goes off with it.
+                   CASE WHEN {ContractorFromEntrySql} THEN 'kontrahent wpisany w ERP'
+                        ELSE ISNULL(p.ContractorSource, '') END AS ContractorSource,
+                   CASE WHEN {ContractorFromEntrySql} THEN CONVERT(BIT, 0)
+                        ELSE ISNULL(p.ContractorFromBankAccount, CONVERT(BIT, 0)) END
+                        AS ContractorFromBankAccount,
                    ISNULL(p.Notes, '')                    AS Notes,
                    ISNULL(p.Strategy, '')                 AS Strategy,
                    ISNULL(p.Status, 'Proposed')           AS Status,
@@ -274,8 +300,7 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                 ORDER BY q.PaymentId
             ) AS p
             LEFT JOIN CDN.KntKarty AS k
-                ON k.Knt_GIDNumer = ISNULL(p.ContractorId,
-                       CASE WHEN z.KAZ_KNTTyp = 32 THEN z.KAZ_KntNumer ELSE 0 END)
+                ON k.Knt_GIDNumer = {QueueContractorSql}
                AND k.Knt_GIDTyp = 32
             LEFT JOIN CDN.Urzedy AS urz
                 ON z.KAZ_KNTTyp = 4304 AND urz.URZ_GIDNumer = z.KAZ_KntNumer
@@ -283,7 +308,8 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                 ON z.KAZ_KNTTyp = 944 AND prc.Prc_GIDNumer = z.KAZ_KntNumer
             LEFT JOIN pay.AdvisorReview AS ar
                 ON ar.PaymentId = p.PaymentId
-               AND (ar.Status = 'Running' OR (ar.Status = 'Done' AND ar.ContractorId = p.ContractorId))
+               AND (ar.Status = 'Running'
+                    OR (ar.Status = 'Done' AND ar.ContractorId = {QueueContractorSql}))
             WHERE RTRIM(rap.KRP_Seria) IN ({string.Join(", ", seriesParameters)})
               AND rap.KRP_DataOtwarcia >= DATEDIFF(DAY, '1800-12-28', @from)
               {(withHistory ? string.Empty : $"AND z.{HasWorkSql}")}
@@ -330,7 +356,7 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
     public async Task<IReadOnlyList<SuggestionRow>> GetSuggestionsAsync(
         DateTime from, CancellationToken token = default)
     {
-        const string sql = """
+        var sql = $"""
             SELECT a.PaymentId, a.DocType, a.DocId, a.DocLp, a.DocNumber, a.Amount,
                    a.Score, ISNULL(a.Reason, '') AS Reason, 0 AS Source
             FROM pay.Allocation AS a
@@ -345,9 +371,10 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                    CAST(0 AS DECIMAL(5,3)), a.Reason, 1
             FROM pay.AdvisorAllocation AS a
             INNER JOIN pay.AdvisorReview AS r ON r.PaymentId = a.PaymentId AND r.Status = 'Done'
-            INNER JOIN pay.Payment AS p ON p.PaymentId = a.PaymentId AND p.ContractorId = r.ContractorId
+            INNER JOIN pay.Payment AS p ON p.PaymentId = a.PaymentId
             INNER JOIN CDN.Zapisy AS z ON z.KAZ_GIDNumer = p.ErpEntryId
             WHERE p.BookingDate >= @from
+              AND r.ContractorId = {QueueContractorSql}
             """;
 
         var rows = new List<SuggestionRow>();
@@ -399,6 +426,38 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
             """;
 
         return ReadDocumentsAsync(sql, token, ("@knt", contractorId), ("@currency", currency.Trim()));
+    }
+
+    /// <summary>
+    /// The document payments a bank entry has settled in ERP, whatever state they are in now.
+    /// </summary>
+    /// <remarks>
+    /// What this transfer actually closed, read from <c>CDN.Rozliczenia</c> rather than taken from
+    /// our own proposals: an entry may have been settled by hand, in ERP, against documents nobody
+    /// here ever proposed. The entry can sit on either side of a settlement, so both are checked -
+    /// as in <see cref="GetEntrySettlementsAsync"/>.
+    ///
+    /// No currency filter and no contractor: whatever the entry settled belongs to it.
+    /// </remarks>
+    public Task<IReadOnlyList<DocumentRow>> GetDocumentsSettledWithEntryAsync(
+        int erpEntryId, CancellationToken token = default)
+    {
+        var sql = $$"""
+            {{DocumentSelect}}
+              AND EXISTS (
+                  SELECT 1
+                  FROM CDN.Rozliczenia AS r
+                  WHERE (r.R2_Dok1Typ = @entryType AND r.R2_Dok1Numer = @entry
+                         AND r.R2_Dok2Typ = pl.TrP_GIDTyp AND r.R2_Dok2Numer = pl.TrP_GIDNumer
+                         AND r.R2_Dok2Lp = pl.TrP_GIDLp)
+                     OR (r.R2_Dok2Typ = @entryType AND r.R2_Dok2Numer = @entry
+                         AND r.R2_Dok1Typ = pl.TrP_GIDTyp AND r.R2_Dok1Numer = pl.TrP_GIDNumer
+                         AND r.R2_Dok1Lp = pl.TrP_GIDLp))
+            ORDER BY pl.TrP_Termin, pl.TrP_GIDNumer
+            """;
+
+        return ReadDocumentsAsync(
+            sql, token, ("@entry", erpEntryId), ("@entryType", XlSettlementEngine.CashEntryGidType));
     }
 
     /// <summary>

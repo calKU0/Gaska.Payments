@@ -113,16 +113,19 @@ public sealed class SettlementFilterOption(SettlementState state, string label, 
     ];
 
     /// <summary>
-    /// The same filter over a contractor's open items.
+    /// The same filter over a contractor's documents.
     /// </summary>
     /// <remarks>
-    /// Three states, not four: a payment settled in full has nothing left on it and is never
-    /// loaded, so an entry for it would be a tick that changes nothing.
+    /// "Rozliczone" means the documents this very transfer closed - not the contractor's settled
+    /// history, which is ERP's to show and would bury the few rows that answer the question. They
+    /// start hidden, because on a transfer there is still work on they are beside the point; on a
+    /// transfer that is settled they are the whole answer and appear without being asked for.
     /// </remarks>
     public static IReadOnlyList<SettlementFilterOption> ForDocuments() =>
     [
         new(SettlementState.Unsettled, "nierozliczone", selected: true),
         new(SettlementState.Partial, "rozliczone częściowo", selected: true),
+        new(SettlementState.Settled, "rozliczone", selected: false),
         new(SettlementState.DoNotSettle, "nie rozliczaj", selected: false),
     ];
 }

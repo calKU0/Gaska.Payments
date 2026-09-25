@@ -293,6 +293,18 @@ public sealed class MainViewModel : ObservableObject
     public IReadOnlyList<SettlementFilterOption> DocumentStateFilters { get; } =
         SettlementFilterOption.ForDocuments();
 
+    /// <summary>
+    /// Whether the settled documents belong on the list: the ones this transfer closed, and only
+    /// those.
+    /// </summary>
+    /// <remarks>
+    /// Shown without being asked for when the transfer itself is settled - there the open items
+    /// are beside the point and what the accountant came to see is what the money went on.
+    /// </remarks>
+    private bool ShowsSettledDocuments =>
+        Selected?.SettlementState == SettlementState.Settled
+        || DocumentStateFilters.Any(f => f.IsSelected && f.State == SettlementState.Settled);
+
     public string DocumentSideFilterSummary => FilterOption.Summarize(DocumentSideFilters);
 
     public string DocumentStateFilterSummary => FilterOption.Summarize(DocumentStateFilters);
@@ -322,12 +334,20 @@ public sealed class MainViewModel : ObservableObject
     /// the list and it is about to be settled - hiding it would leave the sums unexplained, and a
     /// correction the service itself matched is exactly the liability the default filter drops.
     /// The same goes for what the AI proposed: a proposal the filter hides is one nobody weighs.
+    ///
+    /// The settled ones are the documents this transfer has already closed, and the only settled
+    /// ones on the list: the contractor's other closed payments are history, and history belongs
+    /// in ERP rather than on a list of what to do with this transfer.
     /// </remarks>
     private bool ShowsDocument(DocumentItem document) =>
-        document.IsSelected
+        // A document about to be settled. Not one that already is: it arrives ticked as a record
+        // of what ERP holds, and that record is what the state filter governs.
+        (document.IsSelected && document.CanSettle)
         || document.IsAdvised
         || (DocumentSideFilters.Any(f => f.IsSelected && f.IsLiability == document.Row.IsLiability)
-            && DocumentStateFilters.Any(f => f.IsSelected && f.State == document.SettlementState));
+            && (document.SettlementState == SettlementState.Settled
+                ? ShowsSettledDocuments
+                : DocumentStateFilters.Any(f => f.IsSelected && f.State == document.SettlementState)));
 
     private void BuildDocumentsView(PaymentItem? item)
     {
@@ -1123,10 +1143,32 @@ public sealed class MainViewModel : ObservableObject
             documents = [.. advised.Concat(documents)];
         }
 
-        Fill(item, documents);
+        // What this transfer has already settled in ERP. It heads the list and is shown whatever
+        // the filter says: on a settled entry it is the whole answer to what the money went on,
+        // and it is the only way to see a settlement somebody made by hand in ERP.
+        var settledHere = item.HasSettlements
+            ? await _repository.GetDocumentsSettledWithEntryAsync(item.Row.ErpEntryId)
+            : [];
+
+        if (settledHere.Count > 0)
+        {
+            documents = [.. settledHere.Concat(documents).DistinctBy(Key)];
+        }
+
+        Fill(item, documents, settledHere.Select(Key).ToHashSet());
     }
 
-    private void Fill(PaymentItem item, IReadOnlyList<DocumentRow> documents)
+    /// <summary>A document payment's key in ERP - what the hints and the settlements are matched by.</summary>
+    private static (int DocType, int DocId, int DocLp) Key(DocumentRow row) =>
+        (row.DocType, row.DocId, row.DocLp);
+
+    /// <param name="settledWithPayment">
+    /// The documents this transfer has already settled in ERP - they arrive ticked and locked.
+    /// </param>
+    private void Fill(
+        PaymentItem item,
+        IReadOnlyList<DocumentRow> documents,
+        IReadOnlySet<(int DocType, int DocId, int DocLp)> settledWithPayment)
     {
         foreach (var existing in item.Documents)
         {
@@ -1147,11 +1189,14 @@ public sealed class MainViewModel : ObservableObject
             .DistinctBy(s => (s.DocType, s.DocId, s.DocLp))
             .ToDictionary(s => (s.DocType, s.DocId, s.DocLp));
 
+        var ticks = DefaultTicks(item, documents, suggested, advised);
+
         foreach (var row in documents)
         {
             var key = (row.DocType, row.DocId, row.DocLp);
             var document = new DocumentItem(
-                row, suggested.Contains(key), advised.GetValueOrDefault(key), item.Row.IsIncoming);
+                row, suggested.Contains(key), advised.GetValueOrDefault(key), item.Row.IsIncoming,
+                selected: ticks.Contains(key), settledWithPayment: settledWithPayment.Contains(key));
 
             // A tick can bring a document past the filter, and clearing one can take it away
             // again - the list has to be re-run either way.
@@ -1164,6 +1209,47 @@ public sealed class MainViewModel : ObservableObject
         // Hints naming documents outside the loaded list (another contractor, or a document
         // already settled) simply have nothing to tick - which is right, because they are stale.
         item.RaiseTotals();
+    }
+
+    /// <summary>
+    /// Whose proposal arrives ticked: the engine's, or the model's where it settles the transfer
+    /// exactly and names a different set.
+    /// </summary>
+    /// <remarks>
+    /// The model is asked about precisely the transfers the engine could not settle, so a set of
+    /// its own that closes the transfer to the grosz is an answer to the question the engine left
+    /// open - and ticking it is what the accountant would do by hand. Where the two name the same
+    /// documents there is nothing to choose; where the model's set does not close the transfer, it
+    /// stays a hint, visible and unticked, because a part payment is exactly what has to be
+    /// decided by a human.
+    ///
+    /// Only documents that can actually be settled count towards the sum: open, in the transfer's
+    /// currency, none of them flagged. If any of the model's documents is not among them, its set
+    /// is not a settlement and the engine's proposal stands.
+    /// </remarks>
+    private static IReadOnlySet<(int DocType, int DocId, int DocLp)> DefaultTicks(
+        PaymentItem item,
+        IReadOnlyList<DocumentRow> documents,
+        IReadOnlySet<(int DocType, int DocId, int DocLp)> suggested,
+        IReadOnlyDictionary<(int DocType, int DocId, int DocLp), SuggestionRow> advised)
+    {
+        if (advised.Count == 0 || advised.Keys.ToHashSet().SetEquals(suggested)) return suggested;
+
+        var settleable = documents
+            .Where(row => advised.ContainsKey(Key(row)))
+            .Where(row => row.SettlementFlag == 0 && row.Remaining > 0.004m)
+            .Where(row => string.Equals(row.Currency, item.Currency, StringComparison.OrdinalIgnoreCase))
+            .DistinctBy(Key)
+            .ToList();
+
+        if (settleable.Count != advised.Count) return suggested;
+
+        // The transfer's own side is positive, the other side negative - the same convention the
+        // totals under the list use.
+        var net = settleable.Sum(row =>
+            item.Row.IsIncoming == row.IsLiability ? -row.Remaining : row.Remaining);
+
+        return Math.Abs(item.Remaining - net) < 0.005m ? advised.Keys.ToHashSet() : suggested;
     }
 
     // ---------------------------------------------------------- contractor ---
