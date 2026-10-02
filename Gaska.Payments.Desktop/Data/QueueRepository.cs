@@ -44,7 +44,8 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                             NULLIF(RTRIM(imp.ImN_DokumentObcy), ''), '') AS DokumentObcy,
                    pl.TrP_Rozliczona,
                    RTRIM(ISNULL(pl.TrP_FormaNazwa, '')) AS PaymentForm,
-                   RTRIM(ISNULL(rej.KAR_Seria, '')) AS Register
+                   RTRIM(ISNULL(rej.KAR_Seria, '')) AS Register,
+                   dok.Kwota AS DocAmount, dok.Pozostaje AS DocRemaining, dok.Ile AS PaymentCount
             FROM CDN.TraPlat AS pl
             LEFT JOIN CDN.TraNag AS n
                 ON n.TrN_GIDTyp = pl.TrP_GIDTyp AND n.TrN_GIDNumer = pl.TrP_GIDNumer
@@ -67,6 +68,14 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
             -- everything else: the courier's money lands on K_GLS and nowhere else.
             LEFT JOIN CDN.Rejestry AS rej
                 ON rej.KAR_GIDNumer = pl.TrP_KARNumer AND rej.KAR_GIDTyp = pl.TrP_KARTyp
+            -- The whole document this payment belongs to. An invoice payable in instalments has a
+            -- payment per instalment, and settling one of them settles part of the invoice while
+            -- leaving the others untouched - which the row alone cannot show.
+            OUTER APPLY (
+                SELECT SUM(d.TrP_Kwota) AS Kwota, SUM(d.TrP_Pozostaje) AS Pozostaje, COUNT(*) AS Ile
+                FROM CDN.TraPlat AS d
+                WHERE d.TrP_GIDTyp = pl.TrP_GIDTyp AND d.TrP_GIDNumer = pl.TrP_GIDNumer
+            ) AS dok
             WHERE pl.TrP_GIDTyp NOT IN ({SettlementDocumentTypes.NotSettleableSql})
               -- Only contractor open items are settled. Tax returns hang on offices (4304)
               -- and payrolls on employees (944) - their party number can coincide with somebody's
@@ -543,7 +552,8 @@ public sealed class QueueRepository(string connectionString, RegisterSettings re
                 reader.GetString(7).Trim(), XlDate.ToDateTime(reader.GetInt32(8)),
                 reader.GetInt32(9), reader.GetString(10), reader.GetString(11),
                 reader.GetString(12), Convert.ToInt32(reader.GetValue(13)),
-                reader.GetString(14), reader.GetString(15)));
+                reader.GetString(14), reader.GetString(15),
+                reader.GetDecimal(16), reader.GetDecimal(17), reader.GetInt32(18)));
         }
 
         return rows;

@@ -128,8 +128,51 @@ public sealed class DocumentItem(
     public SettlementState SettlementState =>
         DoNotSettle ? Data.SettlementState.DoNotSettle
         : IsSettled ? Data.SettlementState.Settled
-        : Row.Remaining < Row.Amount - 0.004m ? Data.SettlementState.Partial
+        : IsPartlySettled ? Data.SettlementState.Partial
         : Data.SettlementState.Unsettled;
+
+    /// <summary>
+    /// Whether anything is already settled against the document - on this payment or on another
+    /// instalment of it.
+    /// </summary>
+    /// <remarks>
+    /// The document, not only the payment in hand, because that is the question being asked: an
+    /// invoice payable in instalments carries a payment per instalment, and one of them closed is
+    /// what makes the invoice partly settled. Read off the payment alone, a row whose own
+    /// instalment nobody had touched looked untouched - its full amount in the column and nothing
+    /// to say the rest of the invoice had been paid months ago.
+    /// </remarks>
+    public bool IsPartlySettled =>
+        Row.Remaining < Row.Amount - 0.004m
+        || Row.DocumentRemaining < Row.DocumentAmount - 0.004m;
+
+    /// <summary>
+    /// What the amount in the column is a part of: the payment's own figures, and the document's
+    /// where it has more than one payment.
+    /// </summary>
+    /// <remarks>
+    /// The column shows what is left on this payment, because that is what a tick settles and what
+    /// the totals underneath add up. Everything else about the document belongs here, where it
+    /// explains the figure instead of competing with it.
+    /// </remarks>
+    public string AmountDetail
+    {
+        get
+        {
+            var settled = Row.Amount - Row.Remaining;
+
+            var payment = settled > 0.004m
+                ? $"Kwota płatności {Row.Amount:N2}, rozliczono {settled:N2}, pozostaje {Row.Remaining:N2}."
+                : $"Kwota płatności {Row.Amount:N2}, nic nierozliczone.";
+
+            if (Row.PaymentCount <= 1) return payment;
+
+            var ofDocument = Row.DocumentAmount - Row.DocumentRemaining;
+
+            return $"{payment} Dokument jest płatny w {Row.PaymentCount} ratach: razem "
+                 + $"{Row.DocumentAmount:N2}, rozliczono {ofDocument:N2}, pozostaje {Row.DocumentRemaining:N2}.";
+        }
+    }
 
     public string Symbol => Row.Symbol;
 

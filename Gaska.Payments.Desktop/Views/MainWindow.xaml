@@ -695,9 +695,19 @@
                                                     ElementStyle="{StaticResource CellText}" />
                                 <DataGridTextColumn Header="Waluta" Width="78" MinWidth="72" Binding="{Binding Currency}"
                                                     ElementStyle="{StaticResource CellText}" />
+                                <!--
+                                    Kwota pozostała na tej płatności - to ona się rozliczy po
+                                    zaznaczeniu i to ona wchodzi do sum pod listą. W dymku stoi
+                                    reszta rachunku: ile już rozliczono i jak wygląda cały
+                                    dokument, gdy jest płatny w ratach.
+                                -->
                                 <DataGridTextColumn Width="120" MinWidth="110"
-                                                    Binding="{Binding Remaining, StringFormat={}{0:N2}}"
-                                                    ElementStyle="{StaticResource MoneyCell}">
+                                                    Binding="{Binding Remaining, StringFormat={}{0:N2}}">
+                                    <DataGridTextColumn.ElementStyle>
+                                        <Style TargetType="TextBlock" BasedOn="{StaticResource MoneyCell}">
+                                            <Setter Property="ToolTip" Value="{Binding AmountDetail}" />
+                                        </Style>
+                                    </DataGridTextColumn.ElementStyle>
                                     <DataGridTextColumn.Header>
                                         <TextBlock Text="Pozostaje" Style="{StaticResource HeaderTextRight}"
                                                    Margin="0,0,8,0" />

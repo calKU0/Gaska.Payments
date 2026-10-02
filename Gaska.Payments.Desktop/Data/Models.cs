@@ -83,7 +83,16 @@ public sealed record DocumentRow(
     /// <summary>The payment form as ERP spells it - "Przelew", "Za pobraniem", "Gotówka".</summary>
     string PaymentForm,
     /// <summary>The series of the register the payment is settled on, empty when it names none.</summary>
-    string Register)
+    string Register,
+    /// <summary>What the whole document is worth - every payment of it together.</summary>
+    decimal DocumentAmount,
+    /// <summary>What is still open on the whole document - every payment of it together.</summary>
+    decimal DocumentRemaining,
+    /// <summary>
+    /// How many payments the document has. More than one means instalments, and then this row is
+    /// one of them: settling it does not settle the document.
+    /// </summary>
+    int PaymentCount)
 {
     /// <summary>
     /// Whether this is money a courier collects from the customer at the door.
