@@ -726,8 +726,8 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
 
         if (solutionCount > 1)
         {
-            notes.Add($"Brakującą część {KindOf(payment.IsIncoming)} dałoby się pokryć " +
-                      $"na {solutionCount} różnych sposobów – nie zgaduję, które dokumenty dobrać.");
+            notes.Add($"Brakującą część {KindOf(payment.IsIncoming)} dałoby się pokryć na " +
+                      $"{Counted(solutionCount)} różnych sposobów – nie zgaduję, które dokumenty dobrać.");
             return null;
         }
 
@@ -771,9 +771,9 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
         // would be accepting a coincidence.
         if (candidates.Count > 1 && titleNamedDocuments)
         {
-            notes.Add($"Kwota {KindOf(payment.IsIncoming)} pasuje do {candidates.Count} różnych zestawów " +
-                      $"{SideOf(payment.IsIncoming)} tego kontrahenta, ale w tytule wskazano konkretne " +
-                      "dokumenty – nie podstawiam innych.");
+            notes.Add($"Kwota {KindOf(payment.IsIncoming)} pasuje do {Counted(candidates.Count)} różnych " +
+                      $"zestawów {SideOf(payment.IsIncoming)} tego kontrahenta, ale w tytule wskazano " +
+                      "konkretne dokumenty – nie podstawiam innych.");
             return null;
         }
 
@@ -786,12 +786,15 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
             // is settled first - the order receivables are cleared in anyway - and the operator is
             // told plainly that this was a choice. Nothing here settles by itself: only High does
             // that, and this never gets above Medium.
+            // The oldest set is asked for outright; the comparison between the sets already found
+            // is only a fallback for a search that ran out of room before answering.
             var subset = ambiguous
-                ? candidates.Order(Comparer<List<OpenReceivable>>.Create(CompareByAge)).First()
+                ? SelectOldestFirst(pool, target, tolerance)
+                  ?? candidates.Order(Comparer<List<OpenReceivable>>.Create(CompareByAge)).First()
                 : candidates[0];
 
             var reason = ambiguous
-                ? $"najstarszy z {candidates.Count} zestawów {SideOf(payment.IsIncoming)} o tej kwocie"
+                ? $"najstarszy z {Counted(candidates.Count)} zestawów {SideOf(payment.IsIncoming)} o tej kwocie"
                 : $"kwota {KindOf(payment.IsIncoming)} odpowiada sumie {SideOf(payment.IsIncoming)} kontrahenta";
 
             var allocations = subset
@@ -800,10 +803,10 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
 
             if (ambiguous)
             {
-                notes.Add($"Kwota {KindOf(payment.IsIncoming)} pasuje do {candidates.Count} różnych zestawów " +
-                          $"{SideOf(payment.IsIncoming)} tego kontrahenta, a tytuł nie wskazuje żadnego – " +
-                          $"proponuję najstarszy zestaw (od {subset.Min(r => r.DueDate):dd.MM.yyyy}). " +
-                          "Sprawdź, czy to ten.");
+                notes.Add($"Kwota {KindOf(payment.IsIncoming)} pasuje do {Counted(candidates.Count)} różnych " +
+                          $"zestawów {SideOf(payment.IsIncoming)} tego kontrahenta, a tytuł nie wskazuje " +
+                          $"żadnego – proponuję ten, który rozlicza najstarsze (od " +
+                          $"{subset.Min(r => r.DueDate):dd.MM.yyyy}). Sprawdź, czy to ten.");
             }
 
             if (namedButNotOpen)
@@ -894,6 +897,47 @@ public sealed class PaymentMatcher(MatchingOptions? options = null)
             .ThenBy(x => Math.Abs(x.Solution.Difference))
             .Select(x => x.Items)];
     }
+
+    /// <summary>
+    /// The set that settles the contractor's oldest open items first, or null when the search did
+    /// not reach one.
+    /// </summary>
+    /// <remarks>
+    /// Not the same thing as the oldest-looking of the sets the solver happens to report, which is
+    /// what this used to be. The solver stops counting at twenty answers and walks the items by
+    /// descending amount, so with a portfolio where many combinations add up, those twenty are the
+    /// ones built from the largest documents and the oldest set need not be among them at all - the
+    /// proposal then read "the oldest of N sets" while being an arbitrary one of them.
+    ///
+    /// Asked in due-date order instead, the search answers the question directly: it takes each
+    /// item before it tries leaving it out, so the first answer it finds settles the oldest
+    /// document it can, then the next oldest, and so on. One answer is enough, and it is the right
+    /// one by construction.
+    /// </remarks>
+    private List<OpenReceivable>? SelectOldestFirst(
+        IReadOnlyList<OpenReceivable> pool, decimal target, decimal tolerance)
+    {
+        var byAge = pool
+            .OrderBy(r => r.DueDate)
+            .ThenBy(r => r.DocumentNumber, StringComparer.Ordinal)
+            .ToList();
+
+        var solutions = SubsetSumSolver.Solve(
+            [.. byAge.Select(r => SubsetSumSolver.ToCents(r.SignedRemaining))],
+            SubsetSumSolver.ToCents(target),
+            _options.MaxDocumentsPerPayment,
+            SubsetSumSolver.ToCents(tolerance),
+            maxSolutions: 1,
+            searchOrder: [.. Enumerable.Range(0, byAge.Count)]);
+
+        return solutions.Count == 0 ? null : [.. solutions[0].Indices.Select(i => byAge[i])];
+    }
+
+    /// <summary>
+    /// How many sets to speak of, when the solver has stopped counting at its limit.
+    /// </summary>
+    private static string Counted(int count) =>
+        count >= SubsetSumSolver.MaxSolutions ? $"co najmniej {count}" : count.ToString();
 
     /// <summary>
     /// Which of two sets settles the older debt.

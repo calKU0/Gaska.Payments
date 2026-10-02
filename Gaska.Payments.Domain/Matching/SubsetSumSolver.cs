@@ -14,21 +14,39 @@ public sealed record SubsetSolution(IReadOnlyList<int> Indices, long Sum, long D
 /// </remarks>
 public static class SubsetSumSolver
 {
+    /// <summary>
+    /// How many answers are collected before the search gives up counting.
+    /// </summary>
+    /// <remarks>
+    /// Public because the caller has to be able to say "at least twenty" rather than "twenty"
+    /// where the number reaches this: past it there is no telling how many sets would add up.
+    /// </remarks>
+    public const int MaxSolutions = 20;
+
+    /// <param name="searchOrder">
+    /// The order the items are walked in, as indices into <paramref name="values"/>. It decides
+    /// which answers are found first: each item is taken before it is left out, so the first
+    /// answer includes the earliest items of this order that any answer can include. Passing the
+    /// items oldest first is therefore how "settle the oldest debt first" is asked for. Left out,
+    /// the search goes by descending amount, which prunes soonest and finds answers fastest.
+    /// </param>
     public static IReadOnlyList<SubsetSolution> Solve(
         IReadOnlyList<long> values,
         long target,
         int maxItems,
         long tolerance = 0,
-        int maxSolutions = 20,
-        int nodeBudget = 400_000)
+        int maxSolutions = MaxSolutions,
+        int nodeBudget = 400_000,
+        IReadOnlyList<int>? searchOrder = null)
     {
         var solutions = new List<SubsetSolution>();
         if (values.Count == 0) return solutions;
 
-        // Descending by absolute value - that prunes branches soonest.
-        var order = Enumerable.Range(0, values.Count)
-            .OrderByDescending(i => Math.Abs(values[i]))
-            .ToArray();
+        // The caller's order where it cares which answer comes first; otherwise descending by
+        // absolute value, which prunes branches soonest.
+        int[] order = searchOrder is not null
+            ? [.. searchOrder]
+            : [.. Enumerable.Range(0, values.Count).OrderByDescending(i => Math.Abs(values[i]))];
 
         var sorted = order.Select(i => values[i]).ToArray();
         var n = sorted.Length;
