@@ -29,6 +29,11 @@ public sealed record StatementArchiveSummary(int Saved, int Refreshed, int Unava
 /// state there is yesterday's to fetch and today's to refresh. A gap left by an outage fills
 /// itself in on the next pass, because the days inside the window are walked through and only the
 /// missing ones are asked for.
+///
+/// A day the bank says it has no statement for is remembered, so that quiet Saturdays are not
+/// asked about for ever - but only a day the register had no entry on. A day money moved on has a
+/// statement coming whatever the bank answers today, and it is asked about again on every pass
+/// until it arrives or leaves the window.
 /// </remarks>
 public sealed class StatementArchive(
     BnpStatementClient bankClient,
@@ -61,9 +66,15 @@ public sealed class StatementArchive(
         var newest = DateTime.Today.AddDays(-1);
         var oldest = DateTime.Today.AddDays(-Math.Max(1, _bnp.StatementBackfillDays));
 
+        // Which day each register had entries on. It is what tells a quiet day from a day whose
+        // statement the bank has simply not produced yet - see the remark on the class.
+        var turnover = await erp.GetRegisterTurnoverDaysAsync(
+            _settlement.AllRegisters, oldest, cancellationToken);
+
         var saved = 0;
         var refreshed = 0;
         var unavailable = 0;
+        var awaited = new List<(string Series, DateTime Day)>();
 
         foreach (var register in registers.Where(r => r.Iban.Length > 0))
         {
@@ -83,14 +94,30 @@ public sealed class StatementArchive(
                 // replaced; anything older that is already on disk is finished with.
                 if (File.Exists(path) && !StillOpen(day)) continue;
 
-                // A day the bank has already answered "no statement" for. It writes one only for a
-                // day with turnover, so on a quiet day there will never be a file - and without
-                // remembering that, every past Saturday was asked about again every hour.
-                if (refused.GetValueOrDefault(day) >= AttemptsBeforeWritingOff(day)) continue;
+                // Money moved on the register that day, so a statement exists or is coming: what
+                // the bank answers today settles nothing. Fridays were being lost this way - the
+                // bank produces a statement on the next working day, so on Saturday it still has
+                // none, three refusals wrote the day off before midday, and on Monday, when the
+                // statement was there, nobody asked for it any more.
+                var expected = turnover.Contains((register.Series, day.Date));
 
-                // A statement we already hold for a later day proves the bank has moved past this
-                // one, so its absence is final.
-                if (latestOnDisk is { } latest && day < latest) continue;
+                if (!expected)
+                {
+                    // A day the bank has already answered "no statement" for. It writes one only
+                    // for a day with turnover, so on a quiet day there will never be a file - and
+                    // without remembering that, every past Saturday was asked about again every
+                    // hour.
+                    if (refused.GetValueOrDefault(day) >= AttemptsBeforeWritingOff(day)) continue;
+
+                    // A statement we already hold for a later day proves the bank has moved past
+                    // this one, so its absence is final.
+                    if (latestOnDisk is { } latest && day < latest) continue;
+                }
+                else if (refused.Remove(day))
+                {
+                    // Written off before the entries arrived - the note was wrong and goes.
+                    learned = true;
+                }
 
                 var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
@@ -105,11 +132,21 @@ public sealed class StatementArchive(
                         // already recorded the reason at debug level.
                         unavailable++;
 
-                        // Written off for good, but only once the day is closed at the bank. A day
-                        // still open has no statement yet by definition, and writing that off
-                        // would mean never fetching it at all.
-                        refused[day] = refused.GetValueOrDefault(day) + 1;
-                        learned = true;
+                        if (expected)
+                        {
+                            // Nothing is remembered: this day is asked about again next pass. The
+                            // window is what ends it, so an account the bank keeps no statements
+                            // for at all costs one request a pass per day inside it.
+                            awaited.Add((register.Series, day));
+                        }
+                        else
+                        {
+                            // Written off, but a day still open at the bank gets more goes first:
+                            // its statement may be minutes away, and writing that off would mean
+                            // never fetching it at all.
+                            refused[day] = refused.GetValueOrDefault(day) + 1;
+                            learned = true;
+                        }
 
                         continue;
                     }
@@ -141,7 +178,36 @@ public sealed class StatementArchive(
             if (learned) RememberRefusals(folder, register.Series, refused);
         }
 
+        ReportAwaited(awaited);
+
         return new StatementArchiveSummary(saved, refreshed, unavailable);
+    }
+
+    /// <summary>
+    /// Says which days had entries but still no statement from the bank.
+    /// </summary>
+    /// <remarks>
+    /// One line per pass rather than one per account and day. Up to three days behind is ordinary
+    /// - the bank writes a statement on the next working day, so Friday's arrives on Monday and
+    /// before a holiday later still. Beyond that it is worth somebody's attention: either the bank
+    /// is late in a way it has not been before, or that account keeps no statements at all.
+    /// </remarks>
+    private void ReportAwaited(IReadOnlyList<(string Series, DateTime Day)> awaited)
+    {
+        if (awaited.Count == 0) return;
+
+        var days = string.Join(", ", awaited
+            .OrderBy(a => a.Series).ThenByDescending(a => a.Day)
+            .Select(a => $"{a.Series} {a.Day:yyyy-MM-dd}"));
+
+        var oldest = awaited.Min(a => a.Day);
+        var behind = (DateTime.Today - oldest).Days;
+
+        logger.Log(
+            behind > 3 ? LogLevel.Warning : LogLevel.Information,
+            "The bank has no statement yet for {Count} days the register had entries on, the oldest "
+            + "{Behind} days back: {Days}. They are asked about again on every pass.",
+            awaited.Count, behind, days);
     }
 
     /// <summary>

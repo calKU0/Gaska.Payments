@@ -292,6 +292,53 @@ public sealed class ErpReadRepository(string connectionString)
         return registers;
     }
 
+    /// <summary>
+    /// The days each register had any entry on, from <paramref name="from"/> onwards.
+    /// </summary>
+    /// <remarks>
+    /// What the archive asks to find out whether a day the bank has no statement for was simply a
+    /// quiet one. An entry on the register means money moved that day, and money that moved is on
+    /// a statement - so if the bank has none yet, it is late, not absent.
+    ///
+    /// The entry's own date, not its report's: a report is a day per register here, but one
+    /// imported or opened by hand can cover a week, and then its opening day says nothing about
+    /// when the money moved.
+    /// </remarks>
+    public async Task<IReadOnlySet<(string Series, DateTime Day)>> GetRegisterTurnoverDaysAsync(
+        IReadOnlyCollection<string> series, DateTime from, CancellationToken cancellationToken = default)
+    {
+        var days = new HashSet<(string, DateTime)>();
+        if (series.Count == 0) return days;
+
+        var parameters = series.Select((_, i) => $"@s{i}").ToArray();
+
+        var sql = $"""
+            SELECT DISTINCT RTRIM(rap.KRP_Seria) AS Series,
+                   CONVERT(DATE, DATEADD(DAY, z.KAZ_DataZapisu, '1800-12-28')) AS Day
+            FROM CDN.Zapisy AS z
+            INNER JOIN CDN.Raporty AS rap
+                ON rap.KRP_GIDNumer = z.KAZ_KRPNumer AND rap.KRP_GIDTyp = z.KAZ_KRPTyp
+            WHERE RTRIM(rap.KRP_Seria) IN ({string.Join(", ", parameters)})
+              AND z.KAZ_DataZapisu >= DATEDIFF(DAY, '1800-12-28', @from)
+            """;
+
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = new SqlCommand(sql, connection) { CommandTimeout = 60 };
+        command.Parameters.AddWithValue("@from", from.Date);
+
+        var index = 0;
+        foreach (var value in series) command.Parameters.AddWithValue(parameters[index++], value);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            days.Add((reader.GetString(0), reader.GetDateTime(1)));
+        }
+
+        return days;
+    }
+
     /// <summary>A contractor's number from their acronym - needed for our own company on VAT legs.</summary>
     public async Task<int> GetContractorIdByAcronymAsync(
         string acronym, CancellationToken cancellationToken = default)
