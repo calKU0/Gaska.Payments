@@ -663,9 +663,24 @@ public sealed class CodPipeline(
         var proposed = 0;
         var withoutDocuments = 0;
 
+        // What the parcels before this one will settle, and which parcel takes it. Every parcel
+        // is read against the document's remaining amount in ERP, which knows nothing of this
+        // file - so two parcels pointing at one invoice both found it open, both matched it to the
+        // grosz, and the second one's settlement was refused on every pass after the first had
+        // closed the invoice.
+        var claimed = new Dictionary<(int, int, int), (decimal Amount, string Waybill)>();
+
         foreach (var parcel in pending)
         {
-            var documents = Documents(parcel, byWaybill, byNumber, out var source);
+            var found = Documents(parcel, byWaybill, byNumber, out var source);
+
+            var documents = found
+                .Select(d => d with
+                {
+                    Remaining = d.Remaining - claimed.GetValueOrDefault((d.DocType, d.DocId, d.DocLp)).Amount,
+                })
+                .Where(d => d.Remaining > 0.004m)
+                .ToList();
 
             // Several documents on one parcel, and the parcel is worth exactly one of them: that
             // one is what it pays for. Nothing is guessed here - a single candidate matching to the
@@ -687,7 +702,7 @@ public sealed class CodPipeline(
                 if (onAmount.Count == 1) documents = onAmount;
             }
 
-            if (documents.Count == 0) withoutDocuments++;
+            if (found.Count == 0) withoutDocuments++;
 
             // Penny for penny, or not at all. A parcel worth less than the invoice it points at
             // would otherwise be settled in part, and a part settlement nobody asked for is worse
@@ -696,6 +711,30 @@ public sealed class CodPipeline(
             var exact = documents.Count > 0 && Math.Abs(outstanding - parcel.Amount) <= 0.004m;
 
             var payout = perParcel is not null ? perParcel[parcel.Waybill] : null;
+
+            if (settleable && exact)
+            {
+                foreach (var document in documents)
+                {
+                    var key = (document.DocType, document.DocId, document.DocLp);
+                    claimed[key] = (claimed.GetValueOrDefault(key).Amount + document.Remaining, parcel.Waybill);
+                }
+            }
+
+            // Everything this parcel points at is already taken by another parcel of the file.
+            // That is a question for accounting - the customer may have paid twice, or the file
+            // may list one payment against both parcels - and nothing here can answer it.
+            var takenBy = documents.Count == 0 && found.Count > 0
+                ? string.Join(", ", found
+                    .Select(d => claimed.GetValueOrDefault((d.DocType, d.DocId, d.DocLp)).Waybill)
+                    .Where(w => w is not null)
+                    .Distinct())
+                : string.Empty;
+
+            var note = takenBy.Length > 0
+                ? $"{string.Join(", ", found.Select(d => d.DocNumber).Distinct())} rozlicza już przesyłka "
+                  + $"{takenBy} z tego zestawienia – pobranie do wyjaśnienia, klient mógł zapłacić dwa razy."
+                : Note(parcel, documents, source, outstanding, exact, settleable);
 
             var entry = new CodEntry(
                 StableId(courier, parcel.Waybill),
@@ -706,9 +745,9 @@ public sealed class CodPipeline(
                 parcel.Amount,
                 parcel.Recipient,
                 CodDescription.For(parcel.Waybill, courier),
-                documents.FirstOrDefault()?.ContractorId ?? 0,
+                found.FirstOrDefault()?.ContractorId ?? 0,
                 settleable && exact ? "High" : "None",
-                Note(parcel, documents, source, outstanding, exact, settleable),
+                note,
                 path,
                 documents,
                 payout?.EntryId ?? 0);

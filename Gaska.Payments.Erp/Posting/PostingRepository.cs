@@ -633,6 +633,17 @@ public sealed class PostingRepository(string connectionString)
               AND p.RegisterSeries IN ({string.Join(", ", parameters)})
               AND z.KAZ_Rozliczony = 0
               AND EXISTS (SELECT 1 FROM pay.Allocation AS a WHERE a.PaymentId = p.PaymentId)
+              -- A document closed since - by another entry, or by hand - leaves nothing to settle,
+              -- and XL refuses the whole set with 203 on every pass. The entry stays with its
+              -- error for somebody to look at.
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pay.Allocation AS a
+                  INNER JOIN CDN.TraPlat AS pl
+                      ON pl.TrP_GIDTyp = a.DocType AND pl.TrP_GIDNumer = a.DocId AND pl.TrP_GIDLp = a.DocLp
+                  WHERE a.PaymentId = p.PaymentId
+                    AND a.SettlementId IS NULL
+                    AND (pl.TrP_Rozliczona = 1 OR pl.TrP_Pozostaje <= 0.004))
             ORDER BY p.BookingDate, p.PaymentId
             """;
 
