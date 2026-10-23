@@ -28,7 +28,7 @@ public sealed class ErpReadRepository(string connectionString)
                     p.TrP_GIDTyp, p.TrP_GIDNumer, p.TrP_GIDLp, p.TrP_Typ,
                     p.TrP_Kwota, p.TrP_Pozostaje, p.TrP_Waluta, p.TrP_Termin,
                     p.TrP_KntTyp, p.TrP_KntNumer
-                FROM CDN.TraPlat p
+                FROM CDN.TraPlat p WITH (NOLOCK)
                 WHERE p.TrP_GIDTyp IN ({ReceivableDocTypes})
                   AND p.{PaymentSettlement.OpenSql} AND p.TrP_Pozostaje > 0
             )
@@ -57,17 +57,17 @@ public sealed class ErpReadRepository(string connectionString)
                 RTRIM(ISNULL(zam.ZaN_ZamSeria, ''))                                     AS OrderSeries,
                 ISNULL(ksef.KSF_Numer, '')                                              AS KsefNumber
             FROM Platnosci p
-            INNER JOIN CDN.TraNag n
+            INNER JOIN CDN.TraNag n WITH (NOLOCK)
                 ON n.TrN_GIDTyp = p.TrP_GIDTyp AND n.TrN_GIDNumer = p.TrP_GIDNumer
-            INNER JOIN CDN.Obiekty o
+            INNER JOIN CDN.Obiekty o WITH (NOLOCK)
                 ON o.OB_GIDTyp = p.TrP_GIDTyp
-            LEFT JOIN CDN.KntKarty k
+            LEFT JOIN CDN.KntKarty k WITH (NOLOCK)
                 ON k.Knt_GIDTyp = p.TrP_KntTyp AND k.Knt_GIDNumer = p.TrP_KntNumer
-            LEFT JOIN CDN.ZamNag zam
+            LEFT JOIN CDN.ZamNag zam WITH (NOLOCK)
                 ON n.TrN_ZaNTyp = 960 AND zam.ZaN_GIDNumer = n.TrN_ZaNNumer
             OUTER APPLY (
                 SELECT TOP 1 k.KSF_Numer
-                FROM CDN.KSeFDokumenty k
+                FROM CDN.KSeFDokumenty k WITH (NOLOCK)
                 WHERE k.KSF_DokTyp = p.TrP_GIDTyp AND k.KSF_DokNumer = p.TrP_GIDNumer AND k.KSF_Numer <> ''
                 ORDER BY k.KSF_ID DESC
             ) ksef
@@ -173,10 +173,10 @@ public sealed class ErpReadRepository(string connectionString)
                 zam.ZaN_ZamNumer                      AS OrderNumber,
                 zam.ZaN_ZamRok                        AS OrderYear,
                 RTRIM(ISNULL(zam.ZaN_ZamSeria, ''))   AS OrderSeries
-            FROM CDN.TraNag AS w
-            INNER JOIN CDN.TraSElem AS s
+            FROM CDN.TraNag AS w WITH (NOLOCK)
+            INNER JOIN CDN.TraSElem AS s WITH (NOLOCK)
                 ON s.TrS_GIDTyp = w.TrN_GIDTyp AND s.TrS_GIDNumer = w.TrN_GIDNumer AND s.TrS_RezTyp = 960
-            INNER JOIN CDN.ZamNag AS zam
+            INNER JOIN CDN.ZamNag AS zam WITH (NOLOCK)
                 ON zam.ZaN_GIDNumer = s.TrS_RezNumer
             WHERE w.TrN_GIDTyp IN (2001, 2005)
               AND w.TrN_SpiTyp IN ({ReceivableDocTypes})
@@ -216,7 +216,7 @@ public sealed class ErpReadRepository(string connectionString)
                    w.TrN_TrNNumer          AS WzNumber,
                    w.TrN_TrNRok            AS WzYear,
                    RTRIM(w.TrN_TrNSeria)   AS WzSeries
-            FROM CDN.TraNag AS w
+            FROM CDN.TraNag AS w WITH (NOLOCK)
             WHERE w.TrN_GIDTyp IN (2001, 2005)          -- goods issues, domestic and export
               AND w.TrN_SpiTyp IN ({ReceivableDocTypes})
               AND w.TrN_Data2 >= @issuedSince
@@ -268,7 +268,7 @@ public sealed class ErpReadRepository(string connectionString)
                    RTRIM(r.KAR_Waluta)     AS Currency,
                    RTRIM(r.KAR_NrRachunku) AS AccountNumber,
                    RTRIM(ISNULL(r.KAR_Kraj, '')) AS Country
-            FROM CDN.Rejestry AS r
+            FROM CDN.Rejestry AS r WITH (NOLOCK)
             WHERE r.KAR_Seria IN ({string.Join(", ", parameters)})
             """;
 
@@ -315,8 +315,8 @@ public sealed class ErpReadRepository(string connectionString)
         var sql = $"""
             SELECT DISTINCT RTRIM(rap.KRP_Seria) AS Series,
                    CONVERT(DATE, DATEADD(DAY, z.KAZ_DataZapisu, '1800-12-28')) AS Day
-            FROM CDN.Zapisy AS z
-            INNER JOIN CDN.Raporty AS rap
+            FROM CDN.Zapisy AS z WITH (NOLOCK)
+            INNER JOIN CDN.Raporty AS rap WITH (NOLOCK)
                 ON rap.KRP_GIDNumer = z.KAZ_KRPNumer AND rap.KRP_GIDTyp = z.KAZ_KRPTyp
             WHERE RTRIM(rap.KRP_Seria) IN ({string.Join(", ", parameters)})
               AND z.KAZ_DataZapisu >= DATEDIFF(DAY, '1800-12-28', @from)
@@ -348,7 +348,7 @@ public sealed class ErpReadRepository(string connectionString)
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
         await using var command = new SqlCommand(
-            "SELECT TOP 1 Knt_GIDNumer FROM CDN.KntKarty WHERE Knt_Akronim = @acronym", connection);
+            "SELECT TOP 1 Knt_GIDNumer FROM CDN.KntKarty WITH (NOLOCK) WHERE Knt_Akronim = @acronym", connection);
         command.Parameters.AddWithValue("@acronym", acronym);
 
         var value = await command.ExecuteScalarAsync(cancellationToken);
@@ -371,7 +371,7 @@ public sealed class ErpReadRepository(string connectionString)
         const string sql = """
             SELECT z.KAZ_GIDNumer, z.KAZ_DataZapisu, z.KAZ_Kwota, RTRIM(z.KAZ_Waluta),
                    ISNULL(z.KAZ_TrescCDC, ''), z.KAZ_Rozliczony, z.KAZ_Pozostaje
-            FROM CDN.Zapisy z
+            FROM CDN.Zapisy z WITH (NOLOCK)
             WHERE z.KAZ_RP = 2 AND z.KAZ_Anulowany = 0 AND z.KAZ_DataZapisu >= @bookedSince
             """;
 
@@ -433,19 +433,19 @@ public sealed class ErpReadRepository(string connectionString)
                    ISNULL(RTRIM(k.Knt_Akronim), '') AS Akronim,
                    ISNULL(RTRIM(k.Knt_Nazwa1), '')  AS Nazwa,
                    ISNULL(RTRIM(k.Knt_Nip), '')     AS Nip
-            FROM CDN.TraPlat AS p
-            LEFT JOIN CDN.TraNag AS n
+            FROM CDN.TraPlat AS p WITH (NOLOCK)
+            LEFT JOIN CDN.TraNag AS n WITH (NOLOCK)
                 ON n.TrN_GIDTyp = p.TrP_GIDTyp AND n.TrN_GIDNumer = p.TrP_GIDNumer
-            LEFT JOIN CDN.KntKarty AS k
+            LEFT JOIN CDN.KntKarty AS k WITH (NOLOCK)
                 ON k.Knt_GIDNumer = p.TrP_KntNumer AND k.Knt_GIDTyp = p.TrP_KntTyp
-            LEFT JOIN CDN.Obiekty AS o ON o.OB_GIDTyp = p.TrP_GIDTyp
+            LEFT JOIN CDN.Obiekty AS o WITH (NOLOCK) ON o.OB_GIDTyp = p.TrP_GIDTyp
             -- Import invoices keep their header in CDN.ImpNag, not in CDN.TraNag.
-            LEFT JOIN CDN.ImpNag AS imp
+            LEFT JOIN CDN.ImpNag AS imp WITH (NOLOCK)
                 ON imp.ImN_GIDTyp = p.TrP_GIDTyp AND imp.ImN_GIDNumer = p.TrP_GIDNumer
             -- Accrual notes keep a readable number in a header of their own.
-            LEFT JOIN CDN.MemNag AS mem
+            LEFT JOIN CDN.MemNag AS mem WITH (NOLOCK)
                 ON mem.MEN_GIDTyp = p.TrP_GIDTyp AND mem.MEN_GIDNumer = p.TrP_GIDNumer
-            LEFT JOIN CDN.UpoNag AS upo
+            LEFT JOIN CDN.UpoNag AS upo WITH (NOLOCK)
                 ON upo.UPN_GIDTyp = p.TrP_GIDTyp AND upo.UPN_GIDNumer = p.TrP_GIDNumer
             WHERE p.TrP_Typ = 1
               AND p.{PaymentSettlement.OpenSql}
@@ -514,12 +514,12 @@ public sealed class ErpReadRepository(string connectionString)
                    ISNULL(RTRIM(k.Knt_Nazwa1), '')  AS Nazwa,
                    ISNULL(RTRIM(k.Knt_Nip), '')     AS Nip,
                    LTRIM(RTRIM(p.TrP_EndToEndId))   AS Referencja
-            FROM CDN.TraPlat AS p
-            LEFT JOIN CDN.TraNag AS n
+            FROM CDN.TraPlat AS p WITH (NOLOCK)
+            LEFT JOIN CDN.TraNag AS n WITH (NOLOCK)
                 ON n.TrN_GIDTyp = p.TrP_GIDTyp AND n.TrN_GIDNumer = p.TrP_GIDNumer
-            LEFT JOIN CDN.KntKarty AS k
+            LEFT JOIN CDN.KntKarty AS k WITH (NOLOCK)
                 ON k.Knt_GIDNumer = p.TrP_KntNumer AND k.Knt_GIDTyp = p.TrP_KntTyp
-            LEFT JOIN CDN.Obiekty AS o ON o.OB_GIDTyp = p.TrP_GIDTyp
+            LEFT JOIN CDN.Obiekty AS o WITH (NOLOCK) ON o.OB_GIDTyp = p.TrP_GIDTyp
             WHERE LEN(LTRIM(RTRIM(ISNULL(p.TrP_EndToEndId, '')))) > 0
               AND p.{PaymentSettlement.OpenSql}
               AND p.TrP_Pozostaje > 0
@@ -568,10 +568,10 @@ public sealed class ErpReadRepository(string connectionString)
         // reading them costs.
         var accountsSql = $"""
             WITH {BankAccountSql.RetiredAccounts}
-            SELECT RkB_ObiNumer, RkB_NrRachunku FROM CDN.RachunkiBankowe
+            SELECT RkB_ObiNumer, RkB_NrRachunku FROM CDN.RachunkiBankowe WITH (NOLOCK)
             WHERE RkB_ObiTyp = 32 AND RkB_NrRachunku <> '' AND {BankAccountSql.InUse}
             UNION
-            SELECT n.NRB_ObNumer, n.NRB_NrRachunkuZnorm FROM CDN.NumeryRachunkow AS n
+            SELECT n.NRB_ObNumer, n.NRB_NrRachunkuZnorm FROM CDN.NumeryRachunkow AS n WITH (NOLOCK)
             WHERE n.NRB_ObTyp = 32 AND n.NRB_NrRachunkuZnorm <> ''
               AND NOT EXISTS (
                   SELECT 1 FROM wycofane AS w
@@ -580,7 +580,7 @@ public sealed class ErpReadRepository(string connectionString)
             """;
 
         const string nipSql = """
-            SELECT Knt_GIDNumer, Knt_Nip FROM CDN.KntKarty WHERE Knt_Nip <> ''
+            SELECT Knt_GIDNumer, Knt_Nip FROM CDN.KntKarty WITH (NOLOCK) WHERE Knt_Nip <> ''
             """;
 
         const string namesSql = """
@@ -588,14 +588,14 @@ public sealed class ErpReadRepository(string connectionString)
                    ISNULL(Knt_Akronim, ''),
                    ISNULL(Knt_Nazwa1, ''),
                    ISNULL(Knt_Nazwa2, '')
-            FROM CDN.KntKarty
+            FROM CDN.KntKarty WITH (NOLOCK)
             WHERE Knt_Nazwa1 <> '' OR Knt_Akronim <> ''
             """;
 
         // Retired cards. Not excluded from the lookups - an account is sometimes on a retired card
         // and on no other - but a live card wins over one when both hold the same number.
         const string archivedSql = """
-            SELECT Knt_GIDNumer FROM CDN.KntKarty WHERE Knt_GIDTyp = 32 AND Knt_Archiwalny = 1
+            SELECT Knt_GIDNumer FROM CDN.KntKarty WITH (NOLOCK) WHERE Knt_GIDTyp = 32 AND Knt_Archiwalny = 1
             """;
 
         await using var connection = new SqlConnection(connectionString);
